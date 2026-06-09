@@ -1537,6 +1537,7 @@ dependencies = [
  "rcgen",
  "serde",
  "thiserror 2.0.18",
+ "tokio",
  "tonic",
  "tower",
  "tracing",

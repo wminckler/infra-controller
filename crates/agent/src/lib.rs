@@ -135,6 +135,16 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
         tracing::warn!("Pretending local host is a DPU. Dev only.");
     }
 
+    // Node-auth bearer token (issue #355): seed a shared source from the
+    // persisted token so the gRPC client presents it; the token renewer in the
+    // main loop keeps it fresh. Absent token => mTLS-only, unchanged behavior.
+    let persisted_node_token = carbide_host_support::registration::read_node_token().await;
+    if persisted_node_token.is_some() {
+        tracing::info!("node-auth: loaded persisted bearer token; requests will use token auth");
+    } else {
+        tracing::info!("node-auth: no persisted bearer token; requests will use mTLS client cert");
+    }
+    let node_token_source = ::rpc::node_token::NodeTokenSource::new(persisted_node_token);
     let forge_client_config = Arc::new(
         ForgeClientConfig::new(
             agent.forge_system.root_ca.clone(),
@@ -143,7 +153,8 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
                 key_path: agent.forge_system.client_key.clone(),
             }),
         )
-        .use_mgmt_vrf()?,
+        .use_mgmt_vrf()?
+        .with_token_source(node_token_source),
     );
 
     match cmdline.cmd {

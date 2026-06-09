@@ -470,6 +470,11 @@ pub struct CarbideConfig {
     #[serde(default)]
     pub machine_identity: MachineIdentityConfig,
 
+    /// Node-auth JWTs issued to Scout / DPU-agent as a replacement for
+    /// Vault-issued mTLS client certs. Section `[node_auth]`.
+    #[serde(default)]
+    pub node_auth: NodeAuthConfig,
+
     /// Disables role-based access control enforcement.
     /// Intended for testing and development only.
     #[serde(default)]
@@ -1493,6 +1498,81 @@ pub struct DpuDeviceAttestationConfig {
     /// and skipped rather than failing startup.
     #[serde(default)]
     pub ca_cert_dir: Option<PathBuf>,
+}
+
+/// Node-auth (Scout / DPU-agent bearer JWT) configuration.
+/// Loaded from `[node_auth]` section in config.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct NodeAuthConfig {
+    /// Master switch. When false, no node-auth JWTs are issued (bootstrap
+    /// responses omit `node_token`) and no bearer authenticator is installed,
+    /// so nodes keep authenticating via mTLS client certs.
+    #[serde(default = "node_auth_default_enabled")]
+    pub enabled: bool,
+    /// `iss` claim placed on issued tokens and required on validation.
+    #[serde(default = "node_auth_default_issuer")]
+    pub issuer: String,
+    /// `aud` claim placed on issued tokens and required on validation.
+    #[serde(default = "node_auth_default_audience")]
+    pub audience: String,
+    /// Lifetime of issued tokens, in seconds. Kept short; clients refresh via
+    /// `RefreshNodeToken` before expiry.
+    #[serde(default = "node_auth_default_token_ttl_sec")]
+    pub token_ttl_sec: u32,
+}
+
+/// Upper bound on issued-token lifetime. Node-auth tokens are meant to be
+/// short-lived and refreshed before expiry; anything beyond a day is almost
+/// certainly a misconfiguration.
+pub const NODE_AUTH_MAX_TOKEN_TTL_SEC: u32 = 86_400;
+
+impl NodeAuthConfig {
+    /// Validates node-auth settings. Only meaningful when
+    /// [`enabled`](Self::enabled) is true; callers should skip it otherwise.
+    pub fn validate(&self) -> eyre::Result<()> {
+        if self.issuer.trim().is_empty() {
+            return Err(eyre::eyre!("[node_auth] issuer must not be empty"));
+        }
+        if self.audience.trim().is_empty() {
+            return Err(eyre::eyre!("[node_auth] audience must not be empty"));
+        }
+        if self.token_ttl_sec == 0 {
+            return Err(eyre::eyre!(
+                "[node_auth] token_ttl_sec must be greater than zero"
+            ));
+        }
+        if self.token_ttl_sec > NODE_AUTH_MAX_TOKEN_TTL_SEC {
+            return Err(eyre::eyre!(
+                "[node_auth] token_ttl_sec {} exceeds maximum {NODE_AUTH_MAX_TOKEN_TTL_SEC}",
+                self.token_ttl_sec
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn node_auth_default_enabled() -> bool {
+    false
+}
+fn node_auth_default_issuer() -> String {
+    "carbide-api".to_string()
+}
+fn node_auth_default_audience() -> String {
+    "carbide-api".to_string()
+}
+fn node_auth_default_token_ttl_sec() -> u32 {
+    3600
+}
+
+impl Default for NodeAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: node_auth_default_enabled(),
+            issuer: node_auth_default_issuer(),
+            audience: node_auth_default_audience(),
+            token_ttl_sec: node_auth_default_token_ttl_sec(),
+        }
+    }
 }
 
 impl From<MachineIdentityConfig> for model::tenant::IdentityConfigValidationBounds {

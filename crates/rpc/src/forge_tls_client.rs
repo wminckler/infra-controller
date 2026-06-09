@@ -41,6 +41,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::forge::VersionRequest;
 use crate::forge_resolver::resolver::ResolverError;
 use crate::forge_tls_client::ConfigurationError::CouldNotReadRootCa;
+use crate::node_token::{BearerAuthService, NodeTokenSource};
 use crate::protos::forge::forge_client::ForgeClient;
 use crate::protos::nmx_c::nmx_controller_client::NmxControllerClient;
 use crate::{forge_resolver, protos};
@@ -94,6 +95,10 @@ pub struct ForgeClientConfig {
     pub socks_proxy: Option<String>,
     pub connect_retries_max: Option<u32>,
     pub connect_retries_interval: Option<Duration>,
+    /// Optional node-auth bearer token source. When set, each request carries an
+    /// `Authorization: Bearer <jwt>` header (issue #355). Independent of mTLS:
+    /// the channel may present a client cert, a token, or both.
+    pub token_source: Option<Arc<NodeTokenSource>>,
 }
 
 impl ForgeClientConfig {
@@ -130,7 +135,16 @@ impl ForgeClientConfig {
             // MR though, I think.
             connect_retries_max: Some(3),
             connect_retries_interval: Some(Duration::from_secs(20)),
+            token_source: None,
         }
+    }
+
+    /// Attaches a node-auth bearer token source. Requests built from this config
+    /// will carry the current token (if any) as an `Authorization` header.
+    #[must_use]
+    pub fn with_token_source(mut self, token_source: Arc<NodeTokenSource>) -> Self {
+        self.token_source = Some(token_source);
+        self
     }
 
     /// This is required when using `ForgeTlsConfig` on a DPU to communicate with site-controller.
@@ -431,7 +445,7 @@ impl<'a> ForgeTlsClient<'a> {
 
         // ping interval + ping timeout should add up to less than tcp_user_timeout,
         // so that the application gets a chance to fix things before the kernel.
-        let hyper_client = legacy::Client::builder(TokioExecutor::new())
+        let raw_client = legacy::Client::builder(TokioExecutor::new())
             .http2_only(true)
             // Send a PING frame every this
             .http2_keep_alive_interval(Some(Duration::from_secs(10)))
@@ -444,6 +458,12 @@ impl<'a> ForgeTlsClient<'a> {
             .pool_max_idle_per_host(2)
             .timer(TokioTimer::new())
             .build(connector);
+        // Stamp the node-auth bearer token onto each request when configured.
+        // A `None` token source makes this a transparent pass-through, so the
+        // boxed service type is identical in both token and mTLS-only modes.
+        let hyper_client =
+            BearerAuthService::new(raw_client, self.forge_client_config.token_source.clone());
+
         // Inject the issuing span's W3C trace context into every request this client sends
         // (issue #2438). Wrapping before `boxed_clone` keeps the erased `BoxCloneService` type.
         let hyper_client = trace_propagation::TraceInjectService::new(hyper_client).boxed_clone();

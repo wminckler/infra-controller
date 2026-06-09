@@ -65,6 +65,7 @@ pub mod forge_tls_client;
 pub mod libmlx;
 pub mod measured_boot;
 pub mod network;
+pub mod node_token;
 pub mod protos;
 pub mod secrets;
 pub mod utils;

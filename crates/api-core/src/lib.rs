@@ -66,6 +66,7 @@ mod machine_validation;
 mod measured_boot;
 mod mqtt_state_change_hook;
 mod network_segment;
+mod node_auth;
 mod run;
 mod scout_stream;
 pub mod secrets;

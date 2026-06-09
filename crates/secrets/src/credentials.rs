@@ -428,6 +428,10 @@ pub enum CredentialKey {
     RackMaintenanceAccessToken {
         rack_id: RackId,
     },
+    /// Site-level ES256 signing keypair for node-auth JWTs issued to Scout / DPU-agent.
+    /// Singleton. Stored as `UsernamePassword { username: kid, password: private_key_pem }`
+    /// (the PKCS#8 PEM private key; the public key is derived from it).
+    NodeAuthSigningKey,
 }
 
 /// The site-wide default credentials endpoint exploration requires before it
@@ -470,6 +474,7 @@ pub enum CredentialPrefix {
     MqttAuth,
     MachineIdentityEncryptionKey,
     RackMaintenanceAccessToken,
+    NodeAuthSigningKey,
 }
 
 impl CredentialPrefix {
@@ -493,6 +498,7 @@ impl CredentialPrefix {
             Self::MqttAuth => "mqtt/",
             Self::MachineIdentityEncryptionKey => "machine_identity/",
             Self::RackMaintenanceAccessToken => "racks/",
+            Self::NodeAuthSigningKey => "node_auth/",
         }
     }
 
@@ -515,6 +521,7 @@ impl CredentialPrefix {
             Self::MqttAuth,
             Self::MachineIdentityEncryptionKey,
             Self::RackMaintenanceAccessToken,
+            Self::NodeAuthSigningKey,
         ]
     }
 }
@@ -573,6 +580,7 @@ impl CredentialKey {
                 CredentialPrefix::MachineIdentityEncryptionKey
             }
             Self::RackMaintenanceAccessToken { .. } => CredentialPrefix::RackMaintenanceAccessToken,
+            Self::NodeAuthSigningKey => CredentialPrefix::NodeAuthSigningKey,
         }
     }
 
@@ -684,6 +692,7 @@ impl CredentialKey {
             CredentialKey::RackMaintenanceAccessToken { rack_id } => {
                 Cow::from(format!("racks/{rack_id}/maintenance/access-token"))
             }
+            CredentialKey::NodeAuthSigningKey => Cow::from("node_auth/signing_key"),
         }
     }
 }

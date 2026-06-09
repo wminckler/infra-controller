@@ -90,6 +90,7 @@ pub fn fully_populated() -> CarbideConfig {
 pub fn get() -> CarbideConfig {
     CarbideConfig {
         default_tenant_routing_profile_type: "EXTERNAL".to_string(),
+        node_auth: Default::default(),
         enable_admin_ui: true,
         web_ui_sidebar_tools: vec![],
         log_history: Default::default(),

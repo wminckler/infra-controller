@@ -68,6 +68,9 @@ pub struct Api {
     pub database_connection: sqlx::PgPool,
     pub(crate) credential_manager: Arc<dyn CredentialManager>,
     pub(crate) certificate_provider: Arc<dyn CertificateProvider>,
+    /// Node-auth JWT issuer/validator for Scout & DPU-agent. `None` when
+    /// `[node_auth]` is disabled (nodes keep using mTLS client certs).
+    pub(crate) node_token_service: Option<Arc<crate::node_auth::NodeTokenService>>,
     pub(crate) redfish_pool: Arc<dyn RedfishClientPool>,
     pub(crate) bmc_session_manager: Arc<crate::credentials::BmcSessionManager>,
     pub(crate) eth_data: EthVirtData,
@@ -811,6 +814,13 @@ impl Forge for Api {
         request: Request<rpc::MachineCertificateRenewRequest>,
     ) -> Result<Response<rpc::MachineCertificateResult>, Status> {
         crate::handlers::credential::renew_machine_certificate(self, request).await
+    }
+
+    async fn refresh_node_token(
+        &self,
+        request: Request<rpc::NodeTokenRefreshRequest>,
+    ) -> Result<Response<rpc::NodeToken>, Status> {
+        crate::handlers::credential::refresh_node_token(self, request)
     }
 
     async fn discover_machine(

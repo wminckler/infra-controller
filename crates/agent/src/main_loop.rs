@@ -34,7 +34,7 @@ use carbide_rpc_utils::dhcp::{DhcpTimestamps, DhcpTimestampsFilePath};
 use carbide_systemd::systemd;
 use carbide_uuid::machine::MachineId;
 use eyre::WrapErr;
-use forge_certs::cert_renewal::ClientCertRenewer;
+use forge_certs::cert_renewal::{ClientCertRenewer, NodeTokenRenewer};
 use forge_dpu_remediation::remediation::{MachineInfo, RemediationExecutor};
 use ipnetwork::IpNetwork;
 use mac_address::MacAddress;
@@ -105,6 +105,18 @@ pub async fn setup_and_run(
     // Setup client certificate renewal
     let client_cert_renewer =
         ClientCertRenewer::new(forge_api_server.clone(), Arc::clone(&forge_client_config));
+
+    // Node-auth token refresher, active only when a token source is configured.
+    let node_token_renewer = forge_client_config
+        .token_source
+        .clone()
+        .map(|token_source| {
+            NodeTokenRenewer::new(
+                forge_api_server.clone(),
+                Arc::clone(&forge_client_config),
+                token_source,
+            )
+        });
 
     let machine_info = MachineInfo::new(machine_id);
     let remediation_executor = RemediationExecutor::new(
@@ -367,6 +379,7 @@ pub async fn setup_and_run(
         periodic_config_reader,
         fmds_updater,
         client_cert_renewer,
+        node_token_renewer,
         hbn_device_names,
         is_hbn_up: false,
         hbn_file_configs: hbn::HBNContainerFileConfigs::default(),
@@ -404,6 +417,9 @@ struct MainLoop {
     periodic_config_reader: Box<periodic_config_fetcher::PeriodicConfigFetcherReader>,
     fmds_updater: FmdsUpdater,
     client_cert_renewer: ClientCertRenewer,
+    /// Refreshes the node-auth bearer token. `None` when node-auth is not in use
+    /// (no token source configured), in which case the agent relies on mTLS.
+    node_token_renewer: Option<NodeTokenRenewer>,
     hbn_device_names: HBNDeviceNames,
     is_hbn_up: bool,
     hbn_file_configs: hbn::HBNContainerFileConfigs,
@@ -1107,6 +1123,10 @@ impl MainLoop {
         self.client_cert_renewer
             .renew_certificates_if_necessary(None)
             .await;
+
+        if let Some(node_token_renewer) = self.node_token_renewer.as_mut() {
+            node_token_renewer.refresh_if_necessary().await;
+        }
 
         if now > self.inventory_updater_time {
             self.inventory_updater_time =

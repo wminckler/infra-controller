@@ -476,11 +476,21 @@ pub(crate) async fn discover_machine(
         None
     };
 
+    // Issue a node-auth JWT alongside the cert once bootstrap is complete
+    // (i.e. when a cert is also being vended). Additive: absent when node-auth
+    // is disabled, so mTLS-only clients are unaffected.
+    let node_token = if attest_key_challenge.is_none() {
+        crate::node_auth::issue_node_token(&api.node_token_service, &stable_machine_id.to_string())
+    } else {
+        None
+    };
+
     let response = Ok(Response::new(rpc::MachineDiscoveryResult {
         machine_id: Some(stable_machine_id),
         machine_certificate,
         attest_key_challenge,
         machine_interface_id: Some(interface.id),
+        node_token,
     }));
 
     if hardware_info.is_dpu()

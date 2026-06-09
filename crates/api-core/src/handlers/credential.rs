@@ -758,3 +758,43 @@ pub(crate) async fn renew_machine_certificate(
 
     Err(CarbideError::ClientCertificateError("no client certificate presented?".to_string()).into())
 }
+
+/// Re-issues a short-lived node-auth JWT for an already-bootstrapped node. The
+/// machine identity is taken from the caller's mTLS client certificate, which
+/// surfaces as a `SpiffeMachineIdentifier` principal in the
+/// [`AuthContext`](crate::auth::AuthContext). A bearer JWT alone is rejected so
+/// a stolen token cannot be refreshed indefinitely.
+pub(crate) fn refresh_node_token(
+    api: &Api,
+    request: Request<rpc::NodeTokenRefreshRequest>,
+) -> Result<Response<rpc::NodeToken>, Status> {
+    let auth_context = request
+        .extensions()
+        .get::<crate::auth::AuthContext>()
+        .ok_or_else(|| {
+            Status::unauthenticated("no machine identity presented for node token refresh")
+        })?;
+
+    // A bearer JWT must not authorize minting a fresh JWT: that would give a
+    // stolen token an indefinite refresh window. Require mTLS (a trusted client
+    // certificate) as the proof-of-identity for refresh.
+    if !auth_context.has_trusted_certificate() {
+        return Err(Status::permission_denied(
+            "node token refresh requires mTLS client-certificate authentication",
+        ));
+    }
+
+    let machine_id = auth_context.get_spiffe_machine_id().ok_or_else(|| {
+        Status::unauthenticated("no machine identity presented for node token refresh")
+    })?;
+
+    let service = api
+        .node_token_service
+        .as_ref()
+        .ok_or_else(|| Status::unavailable("node-auth is not enabled on this server"))?;
+
+    let token = service
+        .issue(machine_id)
+        .map_err(|e| CarbideError::internal(format!("failed to issue node-auth token: {e}")))?;
+    Ok(Response::new(token))
+}

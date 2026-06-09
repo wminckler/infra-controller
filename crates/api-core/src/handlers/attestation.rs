@@ -350,6 +350,7 @@ pub(crate) async fn attest_quote(
         return Ok(Response::new(rpc::AttestQuoteResponse {
             success: false,
             machine_certificate: None,
+            node_token: None,
         }));
     }
 
@@ -368,9 +369,12 @@ pub(crate) async fn attest_quote(
         machine_id,
         api.runtime_config.attestation_enabled
     );
+    let node_token = crate::node_auth::issue_node_token(&api.node_token_service, id_str.as_str());
+
     Ok(Response::new(rpc::AttestQuoteResponse {
         success: true,
         machine_certificate: Some(certificate.into()),
+        node_token,
     }))
 }
 

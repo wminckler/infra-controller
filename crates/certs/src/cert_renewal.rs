@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use ::rpc::forge as rpc;
 use ::rpc::forge_tls_client::{self, ApiConfig, ForgeClientConfig};
+use ::rpc::node_token::NodeTokenSource;
 use carbide_host_support::registration;
 use carbide_instrument::{DynamicLog, Event, LogAt, Outcome, emit};
 use eyre::Context;
@@ -150,6 +151,84 @@ impl ClientCertRenewer {
         .wrap_err("renew_certificates: Failed to write certs to disk")?;
 
         Ok(())
+    }
+}
+
+// Node-auth tokens are short-lived; refresh at half of the token's lifetime so
+// a single failed attempt still leaves time to retry before expiry.
+const TOKEN_REFRESH_FRACTION: f64 = 0.5;
+const MIN_TOKEN_REFRESH_FAILURE_TIME_SECS: u64 = 30;
+const MAX_TOKEN_REFRESH_FAILURE_TIME_SECS: u64 = 120;
+
+/// Periodically calls `RefreshNodeToken` and updates the shared
+/// [`NodeTokenSource`] (and on-disk copy) so the gRPC client always presents a
+/// fresh node-auth bearer token. Replaces the cert-renewal cadence for token
+/// auth (issue #355). The refresh call authenticates with the current token (or
+/// mTLS cert during dual-support) carried by `client_config`.
+pub struct NodeTokenRenewer {
+    refresh_time: Instant,
+    forge_api_server: String,
+    client_config: Arc<ForgeClientConfig>,
+    token_source: Arc<NodeTokenSource>,
+}
+
+impl NodeTokenRenewer {
+    pub fn new(
+        forge_api_server: String,
+        client_config: Arc<ForgeClientConfig>,
+        token_source: Arc<NodeTokenSource>,
+    ) -> Self {
+        // First tick refreshes immediately to establish a token with a known
+        // remaining lifetime, then settles into a TTL-derived cadence.
+        Self {
+            refresh_time: Instant::now(),
+            forge_api_server,
+            client_config,
+            token_source,
+        }
+    }
+
+    /// Refreshes the node-auth token once the scheduled time has elapsed.
+    pub async fn refresh_if_necessary(&mut self) {
+        let now = Instant::now();
+        if now < self.refresh_time {
+            return;
+        }
+        let next_secs = match self.refresh().await {
+            Ok(expires_in_sec) => ((f64::from(expires_in_sec) * TOKEN_REFRESH_FRACTION) as u64)
+                .max(MIN_TOKEN_REFRESH_FAILURE_TIME_SECS),
+            Err(err) => {
+                let retry = rand::rng().random_range(
+                    MIN_TOKEN_REFRESH_FAILURE_TIME_SECS..MAX_TOKEN_REFRESH_FAILURE_TIME_SECS,
+                );
+                tracing::error!(
+                    error = format!("{err:#}"),
+                    "Failed to refresh node-auth token. Will retry in {retry}s"
+                );
+                retry
+            }
+        };
+        self.refresh_time = now.add(Duration::from_secs(next_secs));
+    }
+
+    async fn refresh(&mut self) -> Result<u32, eyre::Report> {
+        tracing::info!("Refreshing node-auth token");
+        let mut client = forge_tls_client::ForgeTlsClient::retry_build(&ApiConfig::new(
+            &self.forge_api_server,
+            &self.client_config,
+        ))
+        .await
+        .wrap_err("refresh_node_token: Failed to build Forge API server client")?;
+
+        let token = client
+            .refresh_node_token(tonic::Request::new(rpc::NodeTokenRefreshRequest {}))
+            .await
+            .wrap_err("refresh_node_token: Error while executing the RefreshNodeToken gRPC call")?
+            .into_inner();
+
+        self.token_source.set(token.access_token.clone());
+        registration::write_node_token(Some(token.clone())).await;
+        Ok(token.expires_in_sec)
     }
 }
 

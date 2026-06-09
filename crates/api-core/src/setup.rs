@@ -595,10 +595,47 @@ pub async fn start_api(
         None
     };
 
+    // Node-auth (Scout / DPU-agent bearer JWT). Built only when enabled; loading
+    // the service generates/persists the site signing key on first use. When
+    // explicitly enabled, missing prerequisites fail startup rather than
+    // silently degrading to a disabled state.
+    let node_token_service = if carbide_config.node_auth.enabled {
+        carbide_config.node_auth.validate()?;
+
+        // Bearer tokens must never be served over plaintext, so refuse to start
+        // with node-auth enabled unless the listener is TLS-terminated.
+        if !matches!(carbide_config.listen_mode, ListenMode::Tls) {
+            return Err(eyre::eyre!(
+                "[node_auth] is enabled but listen_mode is not \"tls\"; bearer tokens must not be served over plaintext"
+            ));
+        }
+
+        let trust = carbide_config
+            .auth
+            .as_ref()
+            .and_then(|a| a.trust.as_ref())
+            .ok_or_else(|| {
+                eyre::eyre!("[node_auth] is enabled but [auth.trust] is unset; node-auth requires a trust configuration")
+            })?;
+
+        Some(Arc::new(
+            crate::node_auth::NodeTokenService::load_or_create(
+                credential_manager.as_ref(),
+                trust.spiffe_trust_domain.clone(),
+                trust.spiffe_machine_base_path.clone(),
+                &carbide_config.node_auth,
+            )
+            .await?,
+        ))
+    } else {
+        None
+    };
+
     let api_service = Arc::new(Api {
         certificate_provider,
         common_pools,
         credential_manager,
+        node_token_service,
         database_connection: db_pool.clone(),
         dpu_health_log_limiter: LogLimiter::default(),
         dynamic_settings,

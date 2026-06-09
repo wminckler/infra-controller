@@ -36,10 +36,28 @@ use crate::{SpiffeContext, SpiffeError};
 // This middleware is not expected to enforce anything on its own, so anything
 // that an access control policy might need to do its work should be passed
 // along in the request extensions.
+/// Verifies a bearer token (a node-auth JWT) and, on success, returns the
+/// validated SPIFFE ID URI string from the token's `sub` claim. The
+/// implementation lives outside this crate (api-core's `node_auth`) so the
+/// authn layer stays free of JWT signing/key-management concerns.
+///
+/// Returning the raw SPIFFE URI — rather than a `Principal` — lets the
+/// middleware map it through the SAME [`SpiffeContext`] used for client certs,
+/// so a JWT and an mTLS cert for the same machine yield identical principals.
+pub trait BearerTokenAuthenticator: Send + Sync {
+    /// Returns the validated SPIFFE ID URI if `token` is a valid node-auth JWT,
+    /// or `None` if it is invalid/expired/unrecognized.
+    fn spiffe_id_from_bearer(&self, token: &str) -> Option<String>;
+}
+
 #[derive(Clone)]
 pub struct CertDescriptionMiddleware<AZ: Authorization> {
     pub spiffe_context: Arc<SpiffeContext>,
     pub extra_allowed_certs: Option<AllowedCertCriteria>,
+    /// Optional bearer-token (JWT) authenticator. When set, requests carrying an
+    /// `Authorization: Bearer <jwt>` header gain principals alongside any from
+    /// mTLS client certs (dual-support during the mTLS→JWT migration).
+    pub bearer_authenticator: Option<Arc<dyn BearerTokenAuthenticator>>,
     _authorization: std::marker::PhantomData<AZ>,
 }
 
@@ -51,8 +69,19 @@ impl<AZ: Authorization> CertDescriptionMiddleware<AZ> {
         CertDescriptionMiddleware {
             spiffe_context: Arc::new(spiffe_context),
             extra_allowed_certs,
+            bearer_authenticator: None,
             _authorization: std::marker::PhantomData,
         }
+    }
+
+    /// Enables bearer-token (JWT) authentication using the given authenticator.
+    #[must_use]
+    pub fn with_bearer_authenticator(
+        mut self,
+        authenticator: Arc<dyn BearerTokenAuthenticator>,
+    ) -> Self {
+        self.bearer_authenticator = Some(authenticator);
+        self
     }
 }
 
@@ -216,6 +245,12 @@ impl Principal {
     pub fn from_web_cookie(user: String, group: String) -> Self {
         Principal::ExternalUser(ExternalUserInfo::new(None, group, Some(user)))
     }
+}
+
+/// Extracts the token from an `Authorization: Bearer <token>` header, if present.
+fn bearer_token_from_headers(headers: &hyper::HeaderMap) -> Option<&str> {
+    let value = headers.get(hyper::header::AUTHORIZATION)?.to_str().ok()?;
+    value.strip_prefix("Bearer ").map(str::trim)
 }
 
 // try_external_cert will return a Pricipal::ExternalUser if this looks like some external cert
@@ -411,6 +446,15 @@ impl<T: Authorization> AuthContext<T> {
         })
     }
 
+    /// Whether the request presented a trusted client certificate (i.e. was
+    /// authenticated via mTLS). Distinguishes cert-based proof-of-identity from
+    /// bearer-token-only auth, which carries a machine principal but no cert.
+    pub fn has_trusted_certificate(&self) -> bool {
+        self.principals
+            .iter()
+            .any(|p| matches!(p, Principal::TrustedCertificate))
+    }
+
     pub fn get_spiffe_service_id(&self) -> Option<&str> {
         self.principals.iter().find_map(|p| match p {
             Principal::SpiffeServiceIdentifier(identifier) => Some(identifier.as_str()),
@@ -523,12 +567,48 @@ where
     }
 
     fn call(&mut self, mut request: Request<B>) -> Self::Future {
-        if let Some(_req_auth_header) = request.headers().get(hyper::header::AUTHORIZATION) {
-            // If we want to extract additional principals from the request's
-            // Authorization header, we can do it here.
-        }
-        let extensions = request.extensions_mut();
         let mut auth_context = AuthContext::<AZ>::default();
+
+        // Bearer-token (node-auth JWT) authentication. Validated tokens map
+        // through the same SpiffeContext as client certs, so a JWT and an mTLS
+        // cert for the same machine produce identical principals. This runs in
+        // addition to (not instead of) cert auth to support the migration.
+        let bearer_header_present = bearer_token_from_headers(request.headers()).is_some();
+        let mut bearer_authenticated = false;
+        if let Some(authenticator) = &self.authorization_context.bearer_authenticator
+            && let Some(token) = bearer_token_from_headers(request.headers())
+            && let Some(spiffe_uri) = authenticator.spiffe_id_from_bearer(token)
+        {
+            match crate::spiffe_id::SpiffeId::new(&spiffe_uri) {
+                Ok(spiffe_id) => match self
+                    .authorization_context
+                    .spiffe_context
+                    .extract_service_identifier(&spiffe_id)
+                {
+                    Ok(crate::SpiffeIdClass::Service(id)) => {
+                        auth_context
+                            .principals
+                            .push(Principal::SpiffeServiceIdentifier(id));
+                        bearer_authenticated = true;
+                    }
+                    Ok(crate::SpiffeIdClass::Machine(id)) => {
+                        auth_context
+                            .principals
+                            .push(Principal::SpiffeMachineIdentifier(id));
+                        bearer_authenticated = true;
+                    }
+                    Err(e) => {
+                        tracing::debug!("bearer token SPIFFE id not recognized: {e}");
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!("bearer token contained an unparsable SPIFFE URI: {e}");
+                }
+            }
+        }
+
+        let mut client_cert_presented = false;
+        let extensions = request.extensions_mut();
         if let Some(conn_attrs) = extensions.get::<Arc<ConnectionAttributes>>() {
             let peer_certs = &conn_attrs.peer_certificates;
             // rustls presents the end-entity certificate first, intermediates
@@ -562,10 +642,23 @@ where
             // flavor out of the certificate, having a trusted certificate
             // presented by the client is worth recording on its own.
             if !peer_certs.is_empty() {
+                client_cert_presented = true;
                 auth_context.principals.push(Principal::TrustedCertificate);
             }
         } else {
             tracing::warn!("No ConnectionAttributes in request extensions!");
+        }
+
+        // Surface which credential authenticated the request. Scoped to requests
+        // that carry an Authorization header (node-auth clients) to keep this off
+        // the path of cert-only / internal traffic. Lets operators confirm a node
+        // is on bearer-token auth (issue #355) without removing its cert.
+        if bearer_header_present {
+            tracing::info!(
+                bearer_authenticated,
+                client_cert_presented,
+                "node-auth: request presented a bearer token"
+            );
         }
 
         extensions.insert(auth_context);
@@ -576,9 +669,12 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::convert::Infallible;
     use std::task::{Context, Poll};
 
     use carbide_instrument::testing::{MetricsCapture, capture_logs};
+    use hyper::header::AUTHORIZATION;
+    use tower::{Layer, ServiceExt};
 
     use super::*;
     use crate::spiffe_id::TrustDomain;
@@ -601,6 +697,14 @@ mod tests {
 
         fn call(&mut self, _request: Request<B>) -> Self::Future {
             std::future::ready(Ok(()))
+        }
+    }
+
+    /// Test authenticator: maps the literal token "good" to a fixed SPIFFE URI.
+    struct FakeAuth(String);
+    impl BearerTokenAuthenticator for FakeAuth {
+        fn spiffe_id_from_bearer(&self, token: &str) -> Option<String> {
+            (token == "good").then(|| self.0.clone())
         }
     }
 
@@ -732,5 +836,80 @@ mod tests {
             RejectReason::Recognition.label_value().as_str(),
             "recognition"
         );
+    }
+
+    /// Runs a request through the middleware and returns the principals the authn
+    /// layer attached (captured from the request extensions by an inner service).
+    async fn principals_for(
+        middleware: CertDescriptionMiddleware<NoAuthorization>,
+        auth_header: Option<&str>,
+    ) -> Vec<Principal> {
+        let inner = tower::service_fn(|req: Request<tonic::body::Body>| async move {
+            let principals = req
+                .extensions()
+                .get::<AuthContext<NoAuthorization>>()
+                .map(|ctx| ctx.principals.clone())
+                .unwrap_or_default();
+            Ok::<_, Infallible>(principals)
+        });
+        let svc = middleware.layer(inner);
+        let mut builder = Request::builder();
+        if let Some(value) = auth_header {
+            builder = builder.header(AUTHORIZATION, value);
+        }
+        let request = builder.body(tonic::body::Body::empty()).unwrap();
+        svc.oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn valid_bearer_token_yields_machine_principal() {
+        let middleware = CertDescriptionMiddleware::<NoAuthorization>::new(None, spiffe_context())
+            .with_bearer_authenticator(Arc::new(FakeAuth(
+                "spiffe://example.test/carbide-system/machine/m1".to_string(),
+            )));
+        let principals = principals_for(middleware, Some("Bearer good")).await;
+        assert!(
+            principals.contains(&Principal::SpiffeMachineIdentifier("m1".to_string())),
+            "expected machine principal, got {principals:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_bearer_token_yields_no_machine_principal() {
+        let middleware = CertDescriptionMiddleware::<NoAuthorization>::new(None, spiffe_context())
+            .with_bearer_authenticator(Arc::new(FakeAuth(
+                "spiffe://example.test/carbide-system/machine/m1".to_string(),
+            )));
+        let principals = principals_for(middleware, Some("Bearer bogus")).await;
+        assert!(
+            !principals
+                .iter()
+                .any(|p| matches!(p, Principal::SpiffeMachineIdentifier(_))),
+            "rejected token must not yield a machine principal, got {principals:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bearer_ignored_when_no_authenticator_configured() {
+        // Without an authenticator installed, an Authorization header is ignored
+        // (nodes keep using mTLS) — no machine principal appears.
+        let middleware = CertDescriptionMiddleware::<NoAuthorization>::new(None, spiffe_context());
+        let principals = principals_for(middleware, Some("Bearer good")).await;
+        assert!(
+            !principals
+                .iter()
+                .any(|p| matches!(p, Principal::SpiffeMachineIdentifier(_))),
+            "no authenticator => no bearer principals, got {principals:?}"
+        );
+    }
+
+    #[test]
+    fn bearer_token_from_headers_parses_scheme() {
+        let mut headers = hyper::HeaderMap::new();
+        assert_eq!(bearer_token_from_headers(&headers), None);
+        headers.insert(AUTHORIZATION, "Bearer abc.def".parse().unwrap());
+        assert_eq!(bearer_token_from_headers(&headers), Some("abc.def"));
+        headers.insert(AUTHORIZATION, "Basic xyz".parse().unwrap());
+        assert_eq!(bearer_token_from_headers(&headers), None);
     }
 }

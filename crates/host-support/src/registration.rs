@@ -246,13 +246,15 @@ pub async fn register_machine(
     tracing::info!("register_machine discovery_info {:?}", info);
 
     let forge_client_config = create_client_config("register_machine", use_mgmt_vrf, root_ca)?;
-    let response = RegistrationClient::new(forge_api, &forge_client_config, retry)
+    let mut response = RegistrationClient::new(forge_api, &forge_client_config, retry)
         .discover_machine(info)
         .await?;
 
     if response.machine_certificate.is_none() && require_client_certificates {
         return Err(RegistrationError::MissingCertificate);
     }
+
+    write_node_token(response.node_token.take()).await;
 
     if response.machine_certificate.is_some() {
         match write_certs(response.machine_certificate, None).await {
@@ -283,10 +285,11 @@ pub async fn attest_quote(
     tracing::info!("registration client sending attest_quote");
 
     let forge_client_config = create_client_config("attest_quote", use_mgmt_vrf, root_ca)?;
-    let response = RegistrationClient::new(forge_api, &forge_client_config, retry)
+    let mut response = RegistrationClient::new(forge_api, &forge_client_config, retry)
         .attest_quote(quote)
         .await?;
 
+    write_node_token(response.node_token.take()).await;
     let _ = write_certs(response.machine_certificate, None).await;
 
     tracing::info!(
@@ -299,6 +302,50 @@ pub async fn attest_quote(
     );
 
     Ok(response.success)
+}
+
+/// Persists a node-auth bearer token to disk so it survives across restarts
+/// and can be loaded by the gRPC client. Best-effort: logs and returns on error
+/// rather than failing the bootstrap (the mTLS cert remains the fallback).
+pub async fn write_node_token(node_token: Option<rpc::NodeToken>) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(node_token) = node_token else {
+        return;
+    };
+    let path = tls_default::MACHINE_TOKEN;
+    let tmp_path = format!("{path}.tmp");
+
+    // Write to a temp file, lock it down to owner-only, then atomically rename
+    // into place. The bearer JWT is a sensitive credential, so it must never be
+    // world-readable, and an interrupted write must not leave a truncated token
+    // that would break bearer auth on the next read.
+    if let Err(e) = tokio::fs::write(&tmp_path, node_token.access_token.as_bytes()).await {
+        tracing::warn!("Failed to write node-auth token to {tmp_path}: {e}");
+        return;
+    }
+    if let Err(e) =
+        tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await
+    {
+        tracing::warn!("Failed to set permissions on node-auth token {tmp_path}: {e}");
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
+        tracing::warn!("Failed to rename node-auth token {tmp_path} -> {path}: {e}");
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    } else {
+        tracing::info!("Wrote node-auth token to {path}");
+    }
+}
+
+/// Reads the persisted node-auth token from disk, if present.
+pub async fn read_node_token() -> Option<String> {
+    let path = tls_default::MACHINE_TOKEN;
+    match tokio::fs::read_to_string(path).await {
+        Ok(token) if !token.trim().is_empty() => Some(token.trim().to_string()),
+        _ => None,
+    }
 }
 
 pub async fn write_certs(

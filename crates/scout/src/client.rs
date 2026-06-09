@@ -16,6 +16,8 @@
  */
 
 use ::rpc::forge_tls_client::{self, ApiConfig, ForgeClientConfig};
+use ::rpc::node_token::NodeTokenSource;
+use carbide_host_support::registration;
 use forge_tls::client_config::ClientCert;
 pub use scout::{CarbideClientError, CarbideClientResult};
 
@@ -24,13 +26,18 @@ use crate::Options;
 pub(crate) async fn create_forge_client(
     config: &Options,
 ) -> CarbideClientResult<forge_tls_client::ForgeClientT> {
-    let client_config = ForgeClientConfig::new(
+    let mut client_config = ForgeClientConfig::new(
         config.root_ca.clone(),
         Some(ClientCert {
             cert_path: config.client_cert.clone(),
             key_path: config.client_key.clone(),
         }),
     );
+    // Present the persisted node-auth bearer token if one exists (issue #355).
+    // Harmless when absent: the mTLS client cert remains the credential.
+    if let Some(token) = registration::read_node_token().await {
+        client_config = client_config.with_token_source(NodeTokenSource::new(Some(token)));
+    }
     let api_config = ApiConfig::new(&config.api, &client_config);
 
     let client = forge_tls_client::ForgeTlsClient::retry_build(&api_config)

@@ -36,6 +36,13 @@ pub fn default_client_key() -> &'static str {
     CLIENT_KEY
 }
 
+/// Where Scout / DPU-agent persist their node-auth bearer JWT (issue #355).
+pub const MACHINE_TOKEN: &str = "/opt/forge/machine_token.jwt";
+
+pub fn default_machine_token() -> &'static str {
+    MACHINE_TOKEN
+}
+
 #[cfg(test)]
 mod tests {
     use carbide_test_support::value_scenarios;
@@ -50,6 +57,7 @@ mod tests {
                 default_root_ca as fn() -> &'static str => ROOT_CA,
                 default_client_cert as fn() -> &'static str => CLIENT_CERT,
                 default_client_key as fn() -> &'static str => CLIENT_KEY,
+                default_machine_token as fn() -> &'static str => MACHINE_TOKEN,
             }
         );
     }

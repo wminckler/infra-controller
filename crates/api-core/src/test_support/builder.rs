@@ -267,6 +267,7 @@ impl TestApiBuilder {
             runtime_config,
             credential_manager,
             certificate_provider,
+            node_token_service: None,
             database_connection: self.db_pool,
             redfish_pool,
             eth_data,

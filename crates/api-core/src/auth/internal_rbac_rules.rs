@@ -205,6 +205,7 @@ impl InternalRBACRules {
         x.perm("ForgeAgentControl", vec![Machineatron, Scout]);
         x.perm("DiscoverMachine", vec![Anonymous]);
         x.perm("RenewMachineCertificate", vec![Agent]);
+        x.perm("RefreshNodeToken", vec![Agent, Scout]);
         x.perm("DiscoveryCompleted", vec![Machineatron, Scout]);
         x.perm("CleanupMachineCompleted", vec![Machineatron, Scout]);
         x.perm("ReportForgeScoutError", vec![Scout]);

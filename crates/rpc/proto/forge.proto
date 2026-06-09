@@ -212,6 +212,9 @@ service Forge {
   // PRIVILEGED: Creates a new machine from nothing
   rpc DiscoverMachine(MachineDiscoveryInfo) returns (MachineDiscoveryResult);
   rpc RenewMachineCertificate(MachineCertificateRenewRequest) returns (MachineCertificateResult);
+  // Re-issues a short-lived node-auth JWT for an already-bootstrapped Scout/DPU-agent.
+  // Identity is taken from the caller's existing credential (bearer JWT or mTLS cert).
+  rpc RefreshNodeToken(NodeTokenRefreshRequest) returns (NodeToken);
   rpc DiscoveryCompleted(MachineDiscoveryCompletedRequest) returns (MachineDiscoveryCompletedResponse);
   rpc CleanupMachineCompleted(MachineCleanupInfo) returns (MachineCleanupResult);
   // Invoked by forge-scout whenever a certain Machine can not be properly acted on
@@ -1328,6 +1331,9 @@ message AttestQuoteRequest{
 message AttestQuoteResponse{
   bool success = 1;
   MachineCertificate machine_certificate = 2;
+  // Short-lived node-auth JWT for bearer authentication. Issued alongside the
+  // mTLS cert during the dual-support transition; absent when token auth is off.
+  optional NodeToken node_token = 3;
 }
 
 enum CredentialType {
@@ -5077,6 +5083,21 @@ message MachineCertificateResult {
   MachineCertificate machine_certificate = 1;
 }
 
+// A short-lived node-auth JWT issued to Scout / DPU-agent for bearer-token
+// authentication to the API (replacement for Vault-issued mTLS client certs).
+message NodeToken {
+  // Signed JWT-SVID. Subject is the machine's SPIFFE URI, validated by the API
+  // into the same SpiffeMachineIdentifier principal as the mTLS cert path.
+  string access_token = 1;
+  // Seconds until the token expires; clients should refresh before this elapses.
+  uint32 expires_in_sec = 2;
+}
+
+// The identity to refresh is delivered via the existing credential on the
+// channel (bearer JWT or mTLS cert); no body is required.
+message NodeTokenRefreshRequest {
+}
+
 message MachineDiscoveryResult {
   // This is returned to the discovery client from the API. Lets try not to put much in here unless we need it.
   common.MachineId machine_id = 1;
@@ -5086,6 +5107,9 @@ message MachineDiscoveryResult {
   AttestKeyBindChallenge attest_key_challenge = 3;
   // Interface id
   common.MachineInterfaceId machine_interface_id = 4;
+  // Short-lived node-auth JWT for bearer authentication. Issued alongside the
+  // mTLS cert during the dual-support transition; absent when token auth is off.
+  optional NodeToken node_token = 5;
 }
 
 message MachineDiscoveryCompletedResponse {
