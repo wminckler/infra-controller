@@ -573,8 +573,6 @@ where
         // through the same SpiffeContext as client certs, so a JWT and an mTLS
         // cert for the same machine produce identical principals. This runs in
         // addition to (not instead of) cert auth to support the migration.
-        let bearer_header_present = bearer_token_from_headers(request.headers()).is_some();
-        let mut bearer_authenticated = false;
         if let Some(authenticator) = &self.authorization_context.bearer_authenticator
             && let Some(token) = bearer_token_from_headers(request.headers())
             && let Some(spiffe_uri) = authenticator.spiffe_id_from_bearer(token)
@@ -589,13 +587,11 @@ where
                         auth_context
                             .principals
                             .push(Principal::SpiffeServiceIdentifier(id));
-                        bearer_authenticated = true;
                     }
                     Ok(crate::SpiffeIdClass::Machine(id)) => {
                         auth_context
                             .principals
                             .push(Principal::SpiffeMachineIdentifier(id));
-                        bearer_authenticated = true;
                     }
                     Err(e) => {
                         tracing::debug!("bearer token SPIFFE id not recognized: {e}");
@@ -607,7 +603,6 @@ where
             }
         }
 
-        let mut client_cert_presented = false;
         let extensions = request.extensions_mut();
         if let Some(conn_attrs) = extensions.get::<Arc<ConnectionAttributes>>() {
             let peer_certs = &conn_attrs.peer_certificates;
@@ -642,23 +637,10 @@ where
             // flavor out of the certificate, having a trusted certificate
             // presented by the client is worth recording on its own.
             if !peer_certs.is_empty() {
-                client_cert_presented = true;
                 auth_context.principals.push(Principal::TrustedCertificate);
             }
         } else {
             tracing::warn!("No ConnectionAttributes in request extensions!");
-        }
-
-        // Surface which credential authenticated the request. Scoped to requests
-        // that carry an Authorization header (node-auth clients) to keep this off
-        // the path of cert-only / internal traffic. Lets operators confirm a node
-        // is on bearer-token auth (issue #355) without removing its cert.
-        if bearer_header_present {
-            tracing::info!(
-                bearer_authenticated,
-                client_cert_presented,
-                "node-auth: request presented a bearer token"
-            );
         }
 
         extensions.insert(auth_context);

@@ -1555,10 +1555,10 @@ fn node_auth_default_enabled() -> bool {
     false
 }
 fn node_auth_default_issuer() -> String {
-    "carbide-api".to_string()
+    "nico-api".to_string()
 }
 fn node_auth_default_audience() -> String {
-    "carbide-api".to_string()
+    "nico-api".to_string()
 }
 fn node_auth_default_token_ttl_sec() -> u32 {
     3600
