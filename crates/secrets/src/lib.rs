@@ -28,6 +28,7 @@ pub use crate::forge_vault::{
     DedicatedVaultConfig, ForgeVaultClient, SpiffeIdentity, VaultConfig,
     create_dedicated_vault_client, create_raw_vault_client_settings, create_vault_client,
 };
+pub use crate::local_ca::{LocalCaCertProvider, LocalCaMaterial};
 pub use crate::local_credentials::{
     CredentialSnapshot, EnvCredentialsConfig, FileCredentialsConfig, MachineIdentityConfig,
     UsernamePassword,
@@ -38,6 +39,7 @@ pub mod chained_reader;
 pub mod credentials;
 pub mod forge_vault;
 pub mod key_encryption;
+pub mod local_ca;
 pub mod local_credentials;
 pub mod memory_credentials;
 
@@ -72,13 +74,8 @@ pub struct CertificateConfig {
 
 /// Backend used to issue certificates.
 ///
-/// Today both variants are Vault-backed. The enum exists so additional backends
-/// (e.g. an in-process CA whose key lives in a Kubernetes Secret) can be added
-/// without touching the call sites that consume [`CertificateProvider`].
-// The shared `Vault` suffix is intentional: both current variants are Vault
-// backends, distinguished by whether the client is shared with the credential
-// store. The lint resolves once a non-Vault backend is added.
-#[allow(clippy::enum_variant_names)]
+/// The enum exists so backends can be added without touching the call sites
+/// that consume [`CertificateProvider`].
 #[derive(Default, Debug, Clone)]
 pub enum CertBackend {
     /// Reuse the credential store's Vault client — one client, one token lease.
@@ -91,6 +88,10 @@ pub enum CertBackend {
     /// config fails fast instead of silently re-pointing at the credential
     /// Vault.
     DedicatedVault(DedicatedVaultConfig),
+    /// Issue certificates in-process from a local intermediate CA whose key is
+    /// held in memory (loaded from a Kubernetes Secret or a file). No Vault is
+    /// involved.
+    LocalCa(LocalCaMaterial),
 }
 
 /// Builds the certificate provider selected by `config`.
@@ -114,6 +115,11 @@ pub fn create_certificate_provider(
         CertBackend::DedicatedVault(dedicated) => {
             let provider: Arc<dyn CertificateProvider> =
                 create_dedicated_vault_client(dedicated, spiffe, meter)?;
+            Ok(provider)
+        }
+        CertBackend::LocalCa(material) => {
+            let provider: Arc<dyn CertificateProvider> =
+                Arc::new(LocalCaCertProvider::from_pem(material, spiffe)?);
             Ok(provider)
         }
     }

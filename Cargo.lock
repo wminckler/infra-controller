@@ -1224,6 +1224,8 @@ dependencies = [
  "ipnetwork",
  "itertools 0.14.0",
  "jsonwebtoken",
+ "k8s-openapi",
+ "kube",
  "lazy_static",
  "libnmxc",
  "libredfish",
@@ -2829,6 +2831,7 @@ dependencies = [
  "p256 0.14.0-rc.9",
  "rand 0.10.1",
  "rand_core 0.10.1",
+ "rcgen",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2836,9 +2839,11 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.18",
+ "time",
  "tokio",
  "tracing",
  "vaultrs",
+ "x509-parser",
 ]
 
 [[package]]

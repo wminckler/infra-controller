@@ -27,7 +27,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use eyre::{ContextCompat, WrapErr, eyre};
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter};
-use rand::RngExt;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::sleep;
 use vaultrs::api::kv2::requests::SetSecretRequestOptions;
@@ -695,12 +694,8 @@ impl VaultTask<Certificate> for GetCertificateHelper {
         let ttl = if let Some(ttl) = self.ttl.clone() {
             ttl
         } else {
-            // this is to setup a baseline skew of between 60 - 100% of 30 days,
-            // so that not all boxes will renew (or expire) at the same time.
-            let max_hours = 720; // 24 * 30
-            let min_hours = 432; // 24 * 30 * 0.6
-            let mut rng = rand::rng();
-            format!("{}h", rng.random_range(min_hours..max_hours))
+            // Skew the default lifetime so machines don't all renew at once.
+            format!("{}h", crate::certificates::skewed_default_ttl_hours())
         };
 
         let mut certificate_request_builder = GenerateCertificateRequest::builder();

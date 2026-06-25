@@ -106,6 +106,8 @@ hyper-util = { workspace = true }
 ipnetwork = { workspace = true, features = ["serde"] }
 itertools = { workspace = true }
 jsonwebtoken = { workspace = true, features = ["rust_crypto"] }
+k8s-openapi = { workspace = true, features = ["latest"] }
+kube = { workspace = true, features = ["client", "rustls-tls", "aws-lc-rs"] }
 lazy_static = { workspace = true }
 libredfish = { workspace = true }
 librms = { workspace = true }

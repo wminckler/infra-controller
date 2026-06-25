@@ -755,13 +755,15 @@ pub struct CertificatesConfig {
     /// `backend = "dedicated_vault"`, ignored otherwise.
     #[serde(default)]
     pub dedicated_vault: Option<DedicatedVaultTomlConfig>,
+
+    /// Settings for the local in-process CA. Required when
+    /// `backend = "local_ca"`, ignored otherwise.
+    #[serde(default)]
+    pub local_ca: Option<LocalCaTomlConfig>,
 }
 
 /// Tag selecting the certificate backend. The matching settings (if any) live
 /// in their own sub-table, so the choice is explicit rather than inferred.
-// The shared `Vault` suffix is intentional: both current backends are Vault
-// backends. The lint resolves once a non-Vault backend is added.
-#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CertBackendKind {
@@ -770,6 +772,56 @@ pub enum CertBackendKind {
     SharedVault,
     /// Use a dedicated Vault configured under `[certificates.dedicated_vault]`.
     DedicatedVault,
+    /// Use a local in-process CA configured under `[certificates.local_ca]`.
+    LocalCa,
+}
+
+/// `[certificates.local_ca]` settings: where to load the intermediate CA key
+/// material that the in-process signer uses.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalCaTomlConfig {
+    /// Where the CA cert + key are read from.
+    pub source: LocalCaSourceKind,
+
+    /// Path to the PEM CA certificate (`source = "files"`).
+    #[serde(default)]
+    pub cert_path: Option<String>,
+    /// Path to the PEM CA private key (`source = "files"`).
+    #[serde(default)]
+    pub key_path: Option<String>,
+
+    /// Kubernetes Secret name holding the CA (`source = "kube_secret"`).
+    #[serde(default)]
+    pub secret_name: Option<String>,
+    /// Namespace of the Secret (`source = "kube_secret"`).
+    #[serde(default)]
+    pub secret_namespace: Option<String>,
+    /// Secret data key for the CA certificate. Defaults to the TLS-Secret
+    /// convention `tls.crt`.
+    #[serde(default = "default_tls_cert_key")]
+    pub cert_key: String,
+    /// Secret data key for the CA private key. Defaults to `tls.key`.
+    #[serde(default = "default_tls_key_key")]
+    pub key_key: String,
+}
+
+fn default_tls_cert_key() -> String {
+    "tls.crt".to_string()
+}
+
+fn default_tls_key_key() -> String {
+    "tls.key".to_string()
+}
+
+/// Where the local CA's key material is loaded from.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalCaSourceKind {
+    /// Read PEM cert and key from files (dev / local).
+    Files,
+    /// Read `cert_key` / `key_key` from a Kubernetes Secret.
+    KubeSecret,
 }
 
 /// `[certificates.dedicated_vault]` settings.
@@ -798,7 +850,11 @@ pub struct DedicatedVaultTomlConfig {
 
 impl CertificatesConfig {
     /// Convert the parsed section into the runtime certificate config, failing
-    /// fast if a dedicated backend was selected without its settings.
+    /// fast if a backend was selected without its settings.
+    ///
+    /// The `local_ca` backend needs its key material loaded asynchronously
+    /// (from a file or Kubernetes Secret), which a sync converter can't do, so
+    /// it is handled separately by the caller; see [`Self::require_local_ca`].
     pub fn to_certificate_config(&self) -> eyre::Result<carbide_secrets::CertificateConfig> {
         let backend = match self.backend {
             CertBackendKind::SharedVault => carbide_secrets::CertBackend::SharedVault,
@@ -819,8 +875,25 @@ impl CertificatesConfig {
                     },
                 )
             }
+            CertBackendKind::LocalCa => {
+                return Err(eyre::eyre!(
+                    "local_ca backend must be resolved via its asynchronous loader, \
+                     not to_certificate_config"
+                ));
+            }
         };
         Ok(carbide_secrets::CertificateConfig { backend })
+    }
+
+    /// Return the local-CA settings, erroring if `backend = "local_ca"` was
+    /// selected without a `[certificates.local_ca]` section.
+    pub fn require_local_ca(&self) -> eyre::Result<&LocalCaTomlConfig> {
+        self.local_ca.as_ref().ok_or_else(|| {
+            eyre::eyre!(
+                "[certificates] backend = \"local_ca\" requires a \
+                 [certificates.local_ca] section"
+            )
+        })
     }
 }
 
@@ -2673,6 +2746,73 @@ mod tests {
         let result: Result<CertificatesConfig, _> =
             serde_json::from_str(r#"{"backend":"shared_vault","typo":true}"#);
         assert!(result.is_err(), "deny_unknown_fields should reject typos");
+    }
+
+    #[test]
+    fn certificates_local_ca_files_source_parses() {
+        let cfg: CertificatesConfig = serde_json::from_str(
+            r#"{
+                "backend": "local_ca",
+                "local_ca": {
+                    "source": "files",
+                    "cert_path": "/etc/carbide/ca/tls.crt",
+                    "key_path": "/etc/carbide/ca/tls.key"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.backend, CertBackendKind::LocalCa);
+        let local_ca = cfg.require_local_ca().unwrap();
+        assert_eq!(local_ca.source, LocalCaSourceKind::Files);
+        assert_eq!(
+            local_ca.cert_path.as_deref(),
+            Some("/etc/carbide/ca/tls.crt")
+        );
+        assert_eq!(
+            local_ca.key_path.as_deref(),
+            Some("/etc/carbide/ca/tls.key")
+        );
+    }
+
+    #[test]
+    fn certificates_local_ca_kube_secret_defaults_tls_keys() {
+        let cfg: CertificatesConfig = serde_json::from_str(
+            r#"{
+                "backend": "local_ca",
+                "local_ca": {
+                    "source": "kube_secret",
+                    "secret_name": "carbide-issuing-ca",
+                    "secret_namespace": "carbide-system"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let local_ca = cfg.require_local_ca().unwrap();
+        assert_eq!(local_ca.source, LocalCaSourceKind::KubeSecret);
+        assert_eq!(local_ca.cert_key, "tls.crt");
+        assert_eq!(local_ca.key_key, "tls.key");
+    }
+
+    #[test]
+    fn certificates_local_ca_without_section_fails_fast() {
+        let cfg: CertificatesConfig = serde_json::from_str(r#"{"backend":"local_ca"}"#).unwrap();
+        let err = cfg.require_local_ca().unwrap_err();
+        assert!(
+            err.to_string().contains("local_ca"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn certificates_local_ca_not_resolved_by_sync_converter() {
+        // The sync converter cannot load CA material; it must refuse rather
+        // than silently produce a wrong backend.
+        let cfg: CertificatesConfig =
+            serde_json::from_str(r#"{"backend":"local_ca","local_ca":{"source":"files"}}"#)
+                .unwrap();
+        assert!(cfg.to_certificate_config().is_err());
     }
 
     #[test]

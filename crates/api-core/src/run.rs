@@ -23,8 +23,9 @@ use carbide_kms_provider::{
 };
 use carbide_secrets::credentials::{CredentialManager, CredentialReader, CredentialWriter};
 use carbide_secrets::{
-    CredentialConfig, ForgeVaultClient, MemoryCredentialStore, SpiffeIdentity, VaultConfig,
-    create_certificate_provider, create_credential_manager_from, create_vault_client,
+    CertBackend, CertificateConfig, CredentialConfig, ForgeVaultClient, LocalCaMaterial,
+    MemoryCredentialStore, SpiffeIdentity, VaultConfig, create_certificate_provider,
+    create_credential_manager_from, create_vault_client,
 };
 use carbide_utils::HostPortPair;
 use eyre::WrapErr;
@@ -34,7 +35,10 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::subscriber::NoSubscriber;
 
-use crate::cfg::file::{CarbideConfig, ImportSource, ProviderConfig, SecretsConfig};
+use crate::cfg::file::{
+    CarbideConfig, CertBackendKind, CertificatesConfig, ImportSource, LocalCaSourceKind,
+    LocalCaTomlConfig, ProviderConfig, SecretsConfig,
+};
 use crate::listener::AdminUiRoutesBuilder;
 use crate::logging::metrics_endpoint::{MetricsEndpointConfig, run_metrics_endpoint};
 use crate::logging::setup::{
@@ -55,6 +59,87 @@ fn vault_config_for_site(vault: &VaultConfig, carbide_config: &CarbideConfig) ->
         config.spiffe_machine_base_path = Some(trust.spiffe_machine_base_path.clone());
     }
     config
+}
+
+/// Resolve the runtime certificate backend. The Vault backends map directly
+/// from config, but `local_ca` needs its CA key material loaded (from a file
+/// or Kubernetes Secret), which only this async path can do.
+async fn build_certificate_config(
+    certificates: &CertificatesConfig,
+) -> eyre::Result<CertificateConfig> {
+    match certificates.backend {
+        CertBackendKind::LocalCa => {
+            let local_ca = certificates.require_local_ca()?;
+            let material = load_local_ca_material(local_ca).await?;
+            Ok(CertificateConfig {
+                backend: CertBackend::LocalCa(material),
+            })
+        }
+        _ => certificates.to_certificate_config(),
+    }
+}
+
+/// Load the local CA's intermediate key material from a file pair or a
+/// Kubernetes TLS Secret.
+async fn load_local_ca_material(config: &LocalCaTomlConfig) -> eyre::Result<LocalCaMaterial> {
+    match config.source {
+        LocalCaSourceKind::Files => {
+            let cert_path = config.cert_path.as_deref().ok_or_else(|| {
+                eyre::eyre!("[certificates.local_ca] source = \"files\" requires `cert_path`")
+            })?;
+            let key_path = config.key_path.as_deref().ok_or_else(|| {
+                eyre::eyre!("[certificates.local_ca] source = \"files\" requires `key_path`")
+            })?;
+            let ca_cert_pem = tokio::fs::read_to_string(cert_path)
+                .await
+                .wrap_err_with(|| format!("reading local CA certificate from {cert_path}"))?;
+            let ca_key_pem = tokio::fs::read_to_string(key_path)
+                .await
+                .wrap_err_with(|| format!("reading local CA key from {key_path}"))?;
+            Ok(LocalCaMaterial {
+                ca_cert_pem,
+                ca_key_pem,
+            })
+        }
+        LocalCaSourceKind::KubeSecret => {
+            let name = config.secret_name.as_deref().ok_or_else(|| {
+                eyre::eyre!(
+                    "[certificates.local_ca] source = \"kube_secret\" requires `secret_name`"
+                )
+            })?;
+            let namespace = config.secret_namespace.as_deref().ok_or_else(|| {
+                eyre::eyre!(
+                    "[certificates.local_ca] source = \"kube_secret\" requires `secret_namespace`"
+                )
+            })?;
+            // Bound startup: a missing/unreachable API server must fail fast
+            // rather than hang the process boot indefinitely.
+            let secret = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                let client = kube::Client::try_default()
+                    .await
+                    .wrap_err("creating in-cluster Kubernetes client for the local CA secret")?;
+                let api: kube::Api<k8s_openapi::api::core::v1::Secret> =
+                    kube::Api::namespaced(client, namespace);
+                api.get(name)
+                    .await
+                    .wrap_err_with(|| format!("reading CA secret {namespace}/{name}"))
+            })
+            .await
+            .wrap_err("timed out loading local CA secret from Kubernetes")??;
+            let data = secret.data.unwrap_or_default();
+            let read_pem = |key: &str| -> eyre::Result<String> {
+                let bytes = data.get(key).ok_or_else(|| {
+                    eyre::eyre!("CA secret {namespace}/{name} is missing key {key:?}")
+                })?;
+                String::from_utf8(bytes.0.clone())
+                    .wrap_err_with(|| format!("CA secret key {key:?} is not valid UTF-8 PEM"))
+            };
+            Ok(LocalCaMaterial {
+                ca_cert_pem: read_pem(&config.cert_key)?,
+                ca_key_pem: read_pem(&config.key_key)?,
+            })
+        }
+    }
 }
 
 /// Run the carbide-api server until `cancel_token` is cancelled.
@@ -202,7 +287,7 @@ pub async fn run(
     // is fully explicit, never inheriting the credential Vault's env config. The
     // SPIFFE identity comes from the site-resolved credential Vault config so all
     // backends mint under the same identity namespace.
-    let cert_config = carbide_config.certificates.to_certificate_config()?;
+    let cert_config = build_certificate_config(&carbide_config.certificates).await?;
     let certificate_provider = create_certificate_provider(
         &cert_config,
         &vault_client,
