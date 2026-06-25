@@ -25,3 +25,39 @@ subjects:
   - kind: ServiceAccount
     name: {{ include "nico-api.name" . }}
     namespace: {{ include "nico-api.namespace" . }}
+{{- if and (eq .Values.certVending.backend "local_ca") (eq .Values.certVending.localCa.source "kube_secret") }}
+{{- $caSecretNamespace := .Values.certVending.localCa.secretNamespace | default (include "nico-api.namespace" .) }}
+{{- $caSecretName := required "certVending.localCa.secretName is required for the kube_secret source" .Values.certVending.localCa.secretName }}
+---
+# Least-privilege read of the local-CA Secret only. Rendered in the Secret's
+# namespace; the RoleBinding subject points back at nico-api's ServiceAccount,
+# so this works whether or not the Secret lives in the pod's namespace.
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {{ include "nico-api.name" . }}-ca-reader
+  namespace: {{ $caSecretNamespace }}
+  labels:
+    {{- include "nico-api.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ $caSecretName | quote }}]
+    verbs: ["get"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: {{ include "nico-api.name" . }}-ca-reader
+  namespace: {{ $caSecretNamespace }}
+  labels:
+    {{- include "nico-api.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "nico-api.name" . }}-ca-reader
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "nico-api.name" . }}
+    namespace: {{ include "nico-api.namespace" . }}
+{{- end }}

@@ -108,3 +108,40 @@ test_selection_mode = "EnableAll"
 
 [oem_manager_profiles.Dell.PowerEdge_R760.powerefficiency]
 "ServerPwr.1.PSRapidOn" = "Disabled"
+{{- $backend := .Values.certVending.backend | default "shared_vault" }}
+{{- if not (has $backend (list "shared_vault" "dedicated_vault" "local_ca")) }}
+{{- fail (printf "certVending.backend must be one of shared_vault, dedicated_vault, local_ca; got %q" $backend) }}
+{{- end }}
+{{- if ne $backend "shared_vault" }}
+
+# Certificate vending backend. Absent (the default) reuses the credential Vault.
+[certificates]
+backend = "{{ $backend }}"
+{{- if eq $backend "dedicated_vault" }}
+
+[certificates.dedicated_vault]
+address = "{{ required "certVending.dedicatedVault.address is required for the dedicated_vault backend" .Values.certVending.dedicatedVault.address }}"
+pki_mount_location = "{{ required "certVending.dedicatedVault.pkiMountLocation is required for the dedicated_vault backend" .Values.certVending.dedicatedVault.pkiMountLocation }}"
+pki_role_name = "{{ required "certVending.dedicatedVault.pkiRoleName is required for the dedicated_vault backend" .Values.certVending.dedicatedVault.pkiRoleName }}"
+{{- with .Values.certVending.dedicatedVault.vaultCacert }}
+vault_cacert = "{{ . }}"
+{{- end }}
+{{- else if eq $backend "local_ca" }}
+{{- $source := .Values.certVending.localCa.source | default "kube_secret" }}
+{{- if not (has $source (list "kube_secret" "files")) }}
+{{- fail (printf "certVending.localCa.source must be one of kube_secret, files; got %q" $source) }}
+{{- end }}
+
+[certificates.local_ca]
+source = "{{ $source }}"
+{{- if eq $source "kube_secret" }}
+secret_name = "{{ required "certVending.localCa.secretName is required for the kube_secret source" .Values.certVending.localCa.secretName }}"
+secret_namespace = "{{ .Values.certVending.localCa.secretNamespace | default (include "nico-api.namespace" .) }}"
+cert_key = "{{ required "certVending.localCa.certKey is required for the kube_secret source" .Values.certVending.localCa.certKey }}"
+key_key = "{{ required "certVending.localCa.keyKey is required for the kube_secret source" .Values.certVending.localCa.keyKey }}"
+{{- else if eq $source "files" }}
+cert_path = "{{ required "certVending.localCa.certPath is required for the files source" .Values.certVending.localCa.certPath }}"
+key_path = "{{ required "certVending.localCa.keyPath is required for the files source" .Values.certVending.localCa.keyPath }}"
+{{- end }}
+{{- end }}
+{{- end }}

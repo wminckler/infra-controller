@@ -191,6 +191,38 @@ auth:
   ## [tls] admin_root_cafile_path — CA bundle whose client certs are treated as admin ExternalUsers.
   adminRootCafilePath: "/etc/forge/carbide-api/site/admin_root_cert_pem"
 
+## Certificate vending backend — renders the [certificates] config section.
+## Controls how nico-api mints machine/service certs. This is independent of
+## the pod's own serving cert (`certificate:` above) and of the credential
+## store. The default reuses the credential Vault, so it is a no-op.
+##   shared_vault    (default) reuse the credential Vault client — no change.
+##   dedicated_vault issue from a separate Vault (in-cluster ServiceAccount auth).
+##   local_ca        sign in-process from an intermediate CA (k8s Secret or files).
+certVending:
+  backend: shared_vault
+  ## backend: dedicated_vault. Authenticates to Vault with the pod's in-cluster
+  ## ServiceAccount token; root-token auth is intentionally not wired here (it
+  ## would land a secret in a ConfigMap).
+  dedicatedVault:
+    address: ""
+    pkiMountLocation: ""
+    pkiRoleName: ""
+    ## Optional path to the CA bundle that trusts the dedicated Vault's TLS cert.
+    vaultCacert: ""
+  ## backend: local_ca
+  localCa:
+    source: kube_secret      # kube_secret | files
+    ## kube_secret: read the intermediate CA from a Kubernetes TLS Secret.
+    ## nico-api is granted `get` on exactly this Secret (see rbac.yaml).
+    secretName: ""
+    secretNamespace: ""      # empty = release namespace
+    certKey: tls.crt
+    keyKey: tls.key
+    ## files: read the PEM cert/key from these paths. The operator must mount
+    ## them into the pod (e.g. a Secret volume); this chart only sets the paths.
+    certPath: ""
+    keyPath: ""
+
 ## Config files -- can be overridden with custom content
 configFiles:
   nicoApiConfig: ""  # If empty, uses the default from files/
