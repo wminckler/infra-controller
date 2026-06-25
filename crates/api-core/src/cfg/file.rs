@@ -734,6 +734,94 @@ pub struct CarbideConfig {
     /// encrypted in Postgres and vault leaves the credential chain
     /// entirely; when absent, vault remains the credential store.
     pub secrets: Option<SecretsConfig>,
+
+    /// Certificate vending backend. Selected independently of the credential
+    /// store; absent means certs are issued from the credential Vault.
+    #[serde(default)]
+    pub certificates: CertificatesConfig,
+}
+
+/// `[certificates]` config section: selects the backend that vends machine and
+/// service certificates, independently of where credentials are stored.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CertificatesConfig {
+    /// Which backend issues certificates. Defaults to sharing the credential
+    /// Vault client (historical behavior).
+    #[serde(default)]
+    pub backend: CertBackendKind,
+
+    /// Connection settings for a dedicated certificate Vault. Required when
+    /// `backend = "dedicated_vault"`, ignored otherwise.
+    #[serde(default)]
+    pub dedicated_vault: Option<DedicatedVaultTomlConfig>,
+}
+
+/// Tag selecting the certificate backend. The matching settings (if any) live
+/// in their own sub-table, so the choice is explicit rather than inferred.
+// The shared `Vault` suffix is intentional: both current backends are Vault
+// backends. The lint resolves once a non-Vault backend is added.
+#[allow(clippy::enum_variant_names)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertBackendKind {
+    /// Reuse the credential store's Vault client — one client, one token lease.
+    #[default]
+    SharedVault,
+    /// Use a dedicated Vault configured under `[certificates.dedicated_vault]`.
+    DedicatedVault,
+}
+
+/// `[certificates.dedicated_vault]` settings.
+///
+/// The connection-identifying fields are required, so a partial section fails
+/// to parse rather than silently inheriting the credential Vault's process-wide
+/// `VAULT_*` environment configuration.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DedicatedVaultTomlConfig {
+    /// Vault address, e.g. `https://vault-certs.example:8200`.
+    pub address: String,
+    /// PKI secrets-engine mount path on the target Vault.
+    pub pki_mount_location: String,
+    /// PKI role used to sign leaf certificates.
+    pub pki_role_name: String,
+    /// Token for root-token auth; required only when the pod has no Kubernetes
+    /// service-account token.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// CA bundle that signs the target Vault's TLS cert. Defaults to the site
+    /// root / `VAULT_CACERT`.
+    #[serde(default)]
+    pub vault_cacert: Option<String>,
+}
+
+impl CertificatesConfig {
+    /// Convert the parsed section into the runtime certificate config, failing
+    /// fast if a dedicated backend was selected without its settings.
+    pub fn to_certificate_config(&self) -> eyre::Result<carbide_secrets::CertificateConfig> {
+        let backend = match self.backend {
+            CertBackendKind::SharedVault => carbide_secrets::CertBackend::SharedVault,
+            CertBackendKind::DedicatedVault => {
+                let dedicated = self.dedicated_vault.as_ref().ok_or_else(|| {
+                    eyre::eyre!(
+                        "[certificates] backend = \"dedicated_vault\" requires a \
+                         [certificates.dedicated_vault] section"
+                    )
+                })?;
+                carbide_secrets::CertBackend::DedicatedVault(
+                    carbide_secrets::DedicatedVaultConfig {
+                        address: dedicated.address.clone(),
+                        pki_mount_location: dedicated.pki_mount_location.clone(),
+                        pki_role_name: dedicated.pki_role_name.clone(),
+                        token: dedicated.token.clone(),
+                        vault_cacert: dedicated.vault_cacert.clone(),
+                    },
+                )
+            }
+        };
+        Ok(carbide_secrets::CertificateConfig { backend })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2502,6 +2590,90 @@ mod tests {
     use crate::test_support::network_segment::FIXTURE_TENANT_ORG_ID;
 
     const TEST_DATA_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/cfg/test_data");
+
+    #[test]
+    fn certificates_absent_defaults_to_shared_vault() {
+        let cfg: CertificatesConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.backend, CertBackendKind::SharedVault);
+        let runtime = cfg.to_certificate_config().unwrap();
+        assert!(matches!(
+            runtime.backend,
+            carbide_secrets::CertBackend::SharedVault
+        ));
+    }
+
+    #[test]
+    fn certificates_explicit_shared_vault() {
+        let cfg: CertificatesConfig =
+            serde_json::from_str(r#"{"backend":"shared_vault"}"#).unwrap();
+        assert!(matches!(
+            cfg.to_certificate_config().unwrap().backend,
+            carbide_secrets::CertBackend::SharedVault
+        ));
+    }
+
+    #[test]
+    fn certificates_dedicated_vault_maps_all_fields() {
+        let cfg: CertificatesConfig = serde_json::from_str(
+            r#"{
+                "backend": "dedicated_vault",
+                "dedicated_vault": {
+                    "address": "https://vault-certs.example:8200",
+                    "pki_mount_location": "pki",
+                    "pki_role_name": "machine",
+                    "token": "s.abc123"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        match cfg.to_certificate_config().unwrap().backend {
+            carbide_secrets::CertBackend::DedicatedVault(dedicated) => {
+                assert_eq!(dedicated.address, "https://vault-certs.example:8200");
+                assert_eq!(dedicated.pki_mount_location, "pki");
+                assert_eq!(dedicated.pki_role_name, "machine");
+                assert_eq!(dedicated.token.as_deref(), Some("s.abc123"));
+                assert!(dedicated.vault_cacert.is_none());
+            }
+            other => panic!("expected dedicated vault backend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn certificates_dedicated_vault_without_section_fails_fast() {
+        // backend selected but no settings -> must error rather than fall back
+        // to the credential Vault.
+        let cfg: CertificatesConfig =
+            serde_json::from_str(r#"{"backend":"dedicated_vault"}"#).unwrap();
+        let err = cfg.to_certificate_config().unwrap_err();
+        assert!(
+            err.to_string().contains("dedicated_vault"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn certificates_dedicated_vault_missing_required_field_fails_parse() {
+        // `address` is required; omitting it must fail at parse time, not vend
+        // certs from a half-specified Vault.
+        let result: Result<CertificatesConfig, _> = serde_json::from_str(
+            r#"{
+                "backend": "dedicated_vault",
+                "dedicated_vault": {
+                    "pki_mount_location": "pki",
+                    "pki_role_name": "machine"
+                }
+            }"#,
+        );
+        assert!(result.is_err(), "expected parse error for missing address");
+    }
+
+    #[test]
+    fn certificates_unknown_field_rejected() {
+        let result: Result<CertificatesConfig, _> =
+            serde_json::from_str(r#"{"backend":"shared_vault","typo":true}"#);
+        assert!(result.is_err(), "deny_unknown_fields should reject typos");
+    }
 
     #[test]
     fn deserialize_serialize_machine_controller_config() {
