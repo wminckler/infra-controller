@@ -33,9 +33,11 @@ use carbide_uuid::machine::MachineId;
 use model::attestation::spdm::is_bluefield_dpu_irot;
 use model::attestation::{DpuDeviceIdentityError, DpuDeviceIdentityResolver};
 use model::hardware_info::HardwareInfo;
+use model::machine::machine_search_config::MachineSearchConfig;
 
 use crate::CarbideError;
 use crate::api::Api;
+use crate::attestation::dpu_device;
 use crate::attestation::dpu_id_resolver::ApiDpuDeviceIdentityResolver;
 
 /// Resolves the `machine_id` to use for a DPU under the configured
@@ -161,4 +163,66 @@ async fn fetch_irot_chain_pem(api: &Api, hardware_info: &HardwareInfo) -> Option
         .ok()?;
 
     Some(ca_cert.certificate_string)
+}
+
+/// Re-verifies a DPU's hardware identity for an already-enrolled, device-rooted
+/// machine. Re-fetches the BlueField IRoT out-of-band and requires the *live*
+/// device to re-verify (chain to a trusted root) to the **same** `machine_id`.
+///
+/// Used to authorize a cert-free node-token refresh: a stolen bearer token alone
+/// cannot satisfy it, because the controller's out-of-band BMC fetch would not
+/// return that DPU's IRoT. This is a **strict** check — unlike
+/// [`resolve_dpu_device_identity`], there is no best-effort legacy fallback, so a
+/// fetch or verification failure denies the refresh.
+///
+/// Returns `PermissionDenied` when the identity cannot be re-verified or does not
+/// match; `FailedPrecondition` when the machine has no stored hardware info.
+pub(crate) async fn reverify_dpu_device_identity(
+    api: &Api,
+    machine_id: &MachineId,
+) -> Result<(), CarbideError> {
+    let machine = db::machine::find_one(
+        &mut api.db_reader(),
+        machine_id,
+        MachineSearchConfig {
+            include_dpus: true,
+            ..MachineSearchConfig::default()
+        },
+    )
+    .await?
+    .ok_or_else(|| {
+        CarbideError::PermissionDeniedError(
+            "unknown machine for device-identity refresh".to_string(),
+        )
+    })?;
+
+    let hardware_info = machine.hardware_info.ok_or_else(|| {
+        CarbideError::FailedPrecondition(
+            "machine has no hardware info for device-identity re-verification".to_string(),
+        )
+    })?;
+
+    let Some(pem) = fetch_irot_chain_pem(api, &hardware_info).await else {
+        return Err(CarbideError::PermissionDeniedError(
+            "DPU device identity could not be re-verified".to_string(),
+        ));
+    };
+
+    let chain_der = dpu_device::pem_chain_to_der(&pem).map_err(|e| {
+        CarbideError::PermissionDeniedError(format!("IRoT cert chain parse failed: {e}"))
+    })?;
+    let roots = db::attestation::dpu_device_ca_certs::get_all(&mut api.db_reader()).await?;
+    let roots_der: Vec<Vec<u8>> = roots.into_iter().map(|r| r.ca_cert_der).collect();
+    let verified = dpu_device::verify_device_cert_chain(&chain_der, &roots_der, chrono::Utc::now())
+        .map_err(|e| {
+            CarbideError::PermissionDeniedError(format!("IRoT cert verification failed: {e}"))
+        })?;
+
+    if verified.machine_id != *machine_id {
+        return Err(CarbideError::PermissionDeniedError(
+            "re-verified DPU device identity does not match the requesting machine".to_string(),
+        ));
+    }
+
+    Ok(())
 }

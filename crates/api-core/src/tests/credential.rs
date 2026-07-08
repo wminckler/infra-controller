@@ -201,6 +201,61 @@ async fn test_get_bmc_credentials_rejects_caller_without_spiffe_service_id(pool:
 }
 
 #[crate::sqlx_test]
+async fn test_refresh_node_token_rejects_bearer_only_non_device_rooted(pool: sqlx::PgPool) {
+    let env = create_test_env(pool).await;
+
+    // A bearer-only caller (no trusted client certificate) whose machine_id is
+    // NOT device-rooted must be rejected at the source check, before any
+    // hardware re-verification, so a stolen token alone cannot refresh.
+    let legacy_id = carbide_uuid::machine::MachineId::new(
+        carbide_uuid::machine::MachineIdSource::ProductBoardChassisSerial,
+        [7u8; 32],
+        carbide_uuid::machine::MachineType::Dpu,
+    );
+    let mut auth = crate::auth::AuthContext::default();
+    auth.principals
+        .push(carbide_authn::middleware::Principal::SpiffeMachineIdentifier(legacy_id.to_string()));
+
+    let mut request = tonic::Request::new(rpc::forge::NodeTokenRefreshRequest {});
+    request.extensions_mut().insert(auth);
+
+    let err = env
+        .api
+        .refresh_node_token(request)
+        .await
+        .expect_err("bearer-only non-device-rooted refresh should be rejected");
+    assert_eq!(err.code(), Code::PermissionDenied);
+}
+
+#[crate::sqlx_test]
+async fn test_refresh_node_token_bearer_device_rooted_reverifies(pool: sqlx::PgPool) {
+    let env = create_test_env(pool).await;
+
+    // A bearer-only caller with a device-rooted machine_id routes into hardware
+    // re-verification. With no such DPU enrolled, re-verification fails
+    // (PermissionDenied) rather than the request being rejected at the source
+    // check -- confirming the device-rooted branch is taken.
+    let device_id = carbide_uuid::machine::MachineId::new(
+        carbide_uuid::machine::MachineIdSource::DpuDeviceCert,
+        [3u8; 32],
+        carbide_uuid::machine::MachineType::Dpu,
+    );
+    let mut auth = crate::auth::AuthContext::default();
+    auth.principals
+        .push(carbide_authn::middleware::Principal::SpiffeMachineIdentifier(device_id.to_string()));
+
+    let mut request = tonic::Request::new(rpc::forge::NodeTokenRefreshRequest {});
+    request.extensions_mut().insert(auth);
+
+    let err = env
+        .api
+        .refresh_node_token(request)
+        .await
+        .expect_err("device-rooted refresh with no enrolled DPU should fail re-verification");
+    assert_eq!(err.code(), Code::PermissionDenied);
+}
+
+#[crate::sqlx_test]
 async fn test_create_bgp_credential_validates_max_password_length(pool: sqlx::PgPool) {
     let env = create_test_env(pool).await;
 

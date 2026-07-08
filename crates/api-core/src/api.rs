@@ -820,7 +820,7 @@ impl Forge for Api {
         &self,
         request: Request<rpc::NodeTokenRefreshRequest>,
     ) -> Result<Response<rpc::NodeToken>, Status> {
-        crate::handlers::credential::refresh_node_token(self, request)
+        crate::handlers::credential::refresh_node_token(self, request).await
     }
 
     async fn discover_machine(

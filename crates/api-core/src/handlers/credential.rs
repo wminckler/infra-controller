@@ -18,6 +18,7 @@
 use std::fs::File;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 
 use ::rpc::errors::RpcDataConversionError;
 use ::rpc::forge::{self as rpc};
@@ -26,6 +27,7 @@ use carbide_secrets::credentials::{
     BgpCredentialType, BmcCredentialType, CredentialKey, CredentialType, Credentials,
     NicLockdownIkm,
 };
+use carbide_uuid::machine::{MachineId, MachineIdSource};
 use mac_address::MacAddress;
 use model::ConfigValidationError;
 use model::ib::DEFAULT_IB_FABRIC_NAME;
@@ -760,11 +762,20 @@ pub(crate) async fn renew_machine_certificate(
 }
 
 /// Re-issues a short-lived node-auth JWT for an already-bootstrapped node. The
-/// machine identity is taken from the caller's mTLS client certificate, which
-/// surfaces as a `SpiffeMachineIdentifier` principal in the
-/// [`AuthContext`](crate::auth::AuthContext). A bearer JWT alone is rejected so
-/// a stolen token cannot be refreshed indefinitely.
-pub(crate) fn refresh_node_token(
+/// machine identity comes from the caller's `SpiffeMachineIdentifier` principal
+/// in the [`AuthContext`](crate::auth::AuthContext) (populated by an mTLS client
+/// certificate or a validated bearer token).
+///
+/// Refresh is authorized by **either**:
+/// - an mTLS client certificate (`has_trusted_certificate()`) — hosts, and DPUs
+///   during the transition; **or**
+/// - for a device-rooted DPU (`MachineIdSource::DpuDeviceCert`), a live
+///   re-verification of its BlueField IRoT hardware identity that resolves to
+///   the same `machine_id`.
+///
+/// A bare bearer JWT for a non-device-rooted machine is rejected, so a stolen
+/// token alone cannot be refreshed indefinitely.
+pub(crate) async fn refresh_node_token(
     api: &Api,
     request: Request<rpc::NodeTokenRefreshRequest>,
 ) -> Result<Response<rpc::NodeToken>, Status> {
@@ -775,18 +786,30 @@ pub(crate) fn refresh_node_token(
             Status::unauthenticated("no machine identity presented for node token refresh")
         })?;
 
-    // A bearer JWT must not authorize minting a fresh JWT: that would give a
-    // stolen token an indefinite refresh window. Require mTLS (a trusted client
-    // certificate) as the proof-of-identity for refresh.
-    if !auth_context.has_trusted_certificate() {
-        return Err(Status::permission_denied(
-            "node token refresh requires mTLS client-certificate authentication",
-        ));
-    }
+    let has_trusted_certificate = auth_context.has_trusted_certificate();
+    let machine_id = auth_context
+        .get_spiffe_machine_id()
+        .ok_or_else(|| {
+            Status::unauthenticated("no machine identity presented for node token refresh")
+        })?
+        .to_string();
 
-    let machine_id = auth_context.get_spiffe_machine_id().ok_or_else(|| {
-        Status::unauthenticated("no machine identity presented for node token refresh")
-    })?;
+    // Without an mTLS client certificate, only a device-rooted DPU may refresh —
+    // and only after its live hardware identity re-verifies to the same
+    // machine_id. This preserves the property that a stolen bearer token alone
+    // cannot be refreshed.
+    if !has_trusted_certificate {
+        let parsed = MachineId::from_str(&machine_id).map_err(|_| {
+            Status::unauthenticated("unparseable machine identity for node token refresh")
+        })?;
+        if parsed.source() != MachineIdSource::DpuDeviceCert {
+            return Err(Status::permission_denied(
+                "node token refresh requires mTLS client-certificate authentication or a \
+                 verifiable DPU device identity",
+            ));
+        }
+        crate::handlers::dpu_device_identity::reverify_dpu_device_identity(api, &parsed).await?;
+    }
 
     let service = api
         .node_token_service
@@ -794,7 +817,7 @@ pub(crate) fn refresh_node_token(
         .ok_or_else(|| Status::unavailable("node-auth is not enabled on this server"))?;
 
     let token = service
-        .issue(machine_id)
+        .issue(&machine_id)
         .map_err(|e| CarbideError::internal(format!("failed to issue node-auth token: {e}")))?;
     Ok(Response::new(token))
 }
