@@ -197,7 +197,7 @@ revocation/re-issue cuts off new token minting entirely.
 | Chain validation, not pinning | `x5c` verified with rustls `WebPkiClientVerifier` (path building, validity window, client-auth EKU) against the same roots as the TLS listener. |
 | SPIFFE leaf constraints | `carbide_authn::validate_x509_certificate` re-checks leaf-ness, key usage, and the single-URI-SAN rule — same code path as mTLS certs. |
 | No bearer tokens over plaintext | Startup refuses `enabled = true` on a non-TLS listener; the middleware only installs the validator when the listener is TLS-terminated. |
-| No key material at rest beyond the PKI | The server holds no signing key; the client holds only what it already had. Credentials never in logs (token cache has a redacting `Debug`). |
+| No key material at rest beyond the PKI | The server holds no signing key; the client holds only what it already had, and `write_certs` persists the key file owner-only (0600). Credentials never in logs (token cache has a redacting `Debug`). |
 
 ## Component map
 
