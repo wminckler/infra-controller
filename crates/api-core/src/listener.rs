@@ -296,8 +296,34 @@ pub async fn start(
             ),
         ))?;
 
-    let cert_description_layer: CertDescriptionMiddleware<Authorization> =
-        CertDescriptionMiddleware::new(extra_cli_certs, spiffe_context);
+    let cert_description_layer: CertDescriptionMiddleware<Authorization> = {
+        let machine_certs_enabled = api_service.runtime_config.node_auth.mtls_enabled;
+        if !machine_certs_enabled {
+            tracing::warn!(
+                "[node_auth] mtls_enabled = false: machine client certificates will NOT be \
+                 accepted as node identity; nodes must present bearer tokens"
+            );
+        }
+        let layer = CertDescriptionMiddleware::new(extra_cli_certs, spiffe_context)
+            .with_machine_certs_enabled(machine_certs_enabled);
+        // When node-auth is enabled, accept bearer JWTs in addition to mTLS
+        // client certs (dual-support during the mTLS→JWT migration). Bearer
+        // tokens must only be accepted over TLS — never plaintext — so guard the
+        // authenticator on the listener actually being TLS-terminated.
+        match (&api_service.node_jwt_validator, tls_config.is_some()) {
+            (Some(node_jwt_validator), true) => {
+                tracing::info!("node-auth bearer token authentication enabled");
+                layer.with_bearer_authenticator(node_jwt_validator.clone())
+            }
+            (Some(_), false) => {
+                tracing::warn!(
+                    "node-auth is enabled but listener is not TLS; refusing to accept bearer tokens over plaintext"
+                );
+                layer
+            }
+            (None, _) => layer,
+        }
+    };
     let casbin_layer = if let Some(auth_config) = auth_config {
         if let Some(casbin_policy_file) = &auth_config.casbin_policy_file {
             let casbin_authorizer = Arc::new(

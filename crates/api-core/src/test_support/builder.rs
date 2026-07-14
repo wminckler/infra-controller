@@ -286,6 +286,7 @@ impl TestApiBuilder {
             bmc_session_manager,
             bms_client: std::sync::OnceLock::new(),
             secrets_context: self.secrets_context,
+            node_jwt_validator: None,
         }
     }
 }

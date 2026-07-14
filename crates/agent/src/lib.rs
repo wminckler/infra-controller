@@ -143,6 +143,9 @@ pub async fn start(cmdline: command_line::Options) -> eyre::Result<()> {
                 key_path: agent.forge_system.client_key.clone(),
             }),
         )
+        // Node-auth (#355): also present a self-signed bearer JWT minted from
+        // the client cert's key. Ignored by the API unless [node_auth] is enabled.
+        .with_node_jwt()
         .use_mgmt_vrf()?,
     );
 

@@ -41,6 +41,7 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 use crate::forge::VersionRequest;
 use crate::forge_resolver::resolver::ResolverError;
 use crate::forge_tls_client::ConfigurationError::CouldNotReadRootCa;
+use crate::node_jwt::{BearerAuthService, NodeJwtMinter};
 use crate::protos::forge::forge_client::ForgeClient;
 use crate::protos::nmx_c::nmx_controller_client::NmxControllerClient;
 use crate::{forge_resolver, protos};
@@ -94,6 +95,11 @@ pub struct ForgeClientConfig {
     pub socks_proxy: Option<String>,
     pub connect_retries_max: Option<u32>,
     pub connect_retries_interval: Option<Duration>,
+    /// Optional node-auth JWT minter (issue #355). When set, each request
+    /// carries an `Authorization: Bearer <jwt>` self-signed with the client
+    /// certificate's own private key. Independent of mTLS: the channel may
+    /// present a client cert, a token, or both.
+    pub node_jwt_minter: Option<Arc<NodeJwtMinter>>,
 }
 
 impl ForgeClientConfig {
@@ -130,7 +136,19 @@ impl ForgeClientConfig {
             // MR though, I think.
             connect_retries_max: Some(3),
             connect_retries_interval: Some(Duration::from_secs(20)),
+            node_jwt_minter: None,
         }
+    }
+
+    /// Enables node-auth JWTs: requests built from this config mint and carry
+    /// short-lived bearer tokens signed with the configured client cert's key.
+    /// A no-op when no client cert is configured.
+    #[must_use]
+    pub fn with_node_jwt(mut self) -> Self {
+        self.node_jwt_minter = self.client_cert.as_ref().map(|client_cert| {
+            NodeJwtMinter::new(client_cert.cert_path.clone(), client_cert.key_path.clone())
+        });
+        self
     }
 
     /// This is required when using `ForgeTlsConfig` on a DPU to communicate with site-controller.
@@ -444,6 +462,13 @@ impl<'a> ForgeTlsClient<'a> {
             .pool_max_idle_per_host(2)
             .timer(TokioTimer::new())
             .build(connector);
+        // Stamp a freshly-minted node-auth bearer token onto each request when
+        // configured (issue #355). A `None` minter is a transparent pass-through,
+        // so the boxed service type is identical in both modes.
+        let hyper_client = BearerAuthService::new(
+            hyper_client,
+            self.forge_client_config.node_jwt_minter.clone(),
+        );
         // Inject the issuing span's W3C trace context into every request this client sends
         // (issue #2438). Wrapping before `boxed_clone` keeps the erased `BoxCloneService` type.
         let hyper_client = trace_propagation::TraceInjectService::new(hyper_client).boxed_clone();

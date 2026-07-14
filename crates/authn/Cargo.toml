@@ -40,6 +40,7 @@ tracing = { workspace = true }
 carbide-instrument = { path = "../instrument", features = ["test-support"] }
 carbide-test-support = { path = "../test-support" }
 rcgen = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

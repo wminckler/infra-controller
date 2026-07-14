@@ -583,10 +583,39 @@ pub async fn start_api(
         None
     };
 
+    // Node-auth (Scout / DPU-agent bearer JWT, #355). Validate unconditionally:
+    // this rejects the enabled=false + mtls_enabled=false lockout combination
+    // even when bearer tokens are off. When explicitly enabled, missing
+    // prerequisites fail startup rather than silently degrading.
+    carbide_config.node_auth.validate()?;
+    let node_jwt_validator = if carbide_config.node_auth.enabled {
+        // Bearer tokens must never be accepted over plaintext, and the
+        // validator trusts the same roots the TLS listener uses for client
+        // certificates — so a TLS listener is required on both counts.
+        if !matches!(carbide_config.listen_mode, ListenMode::Tls) {
+            return Err(eyre::eyre!(
+                "[node_auth] is enabled but listen_mode is not \"tls\"; bearer tokens must not be accepted over plaintext"
+            ));
+        }
+        let tls_ref = carbide_config
+            .tls
+            .as_ref()
+            .ok_or_else(|| eyre::eyre!("[node_auth] is enabled but [tls] is unset"))?;
+        Some(Arc::new(
+            crate::node_auth::NodeJwtValidator::from_root_ca_file(
+                &tls_ref.root_cafile_path,
+                &carbide_config.node_auth,
+            )?,
+        ))
+    } else {
+        None
+    };
+
     let api_service = Arc::new(Api {
         certificate_provider,
         common_pools,
         credential_manager,
+        node_jwt_validator,
         database_connection: db_pool.clone(),
         dpu_health_log_limiter: LogLimiter::default(),
         dynamic_settings,
