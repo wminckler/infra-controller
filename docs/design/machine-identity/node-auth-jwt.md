@@ -38,6 +38,79 @@ on every gRPC request                            URI SAN through the same
                                                  unchanged
 ```
 
+## Auth flow: new DPU → first authorized gRPC call
+
+**Provisioning & bootstrap (no credentials yet)**
+
+- A new DPU is provisioned (BFB installed via DPF); the `forge-dpu-agent` DPF
+  service starts on it with only two auth-relevant inputs from its config: the
+  API endpoint and the root CA bundle (`forge_system.root_ca`). The cert/key
+  files at `/opt/forge/machine_cert.pem` / `machine_cert.key` don't exist yet.
+- The agent opens a TLS connection to `nico-api` that is **server-auth only**
+  — it verifies the API's cert against the root CA but presents no client
+  credential (the API listener uses `allow_unauthenticated()`, so the
+  connection is accepted with an anonymous principal).
+
+**First credential: the machine certificate**
+
+- The agent calls `DiscoverMachine`
+  (`host-support/registration.rs::register_machine`) carrying its hardware
+  enumeration (`DiscoveryInfo`); this RPC is reachable pre-credential by
+  design.
+- The API registers/matches the machine and returns a `machine_certificate`
+  in the response: a Vault-PKI-issued EC P-256 leaf whose SAN is the machine's
+  SPIFFE URI (`spiffe://<trust-domain>/<ns>/machine/<machine-id>`), plus the
+  issuing CA and private key. (On attestation-enabled sites, hosts get this
+  via `AttestQuote` after a TPM challenge instead; DPUs take the discovery
+  path.)
+- `write_certs` persists leaf+issuing-CA to `/opt/forge/machine_cert.pem` and
+  the key to `/opt/forge/machine_cert.key`. **This existing cert key is the
+  JWT signing key — nothing else is ever created.**
+
+**Minting the JWT (client side, `rpc::node_jwt`)**
+
+- The agent's gRPC client was built with
+  `ForgeClientConfig::new(root_ca, ClientCert{...}).with_node_jwt()`, so a
+  `NodeJwtMinter` watches those two file paths.
+- On the next outgoing RPC, the minter reads cert+key from disk (re-encoding
+  Vault's SEC1 key PEM to PKCS#8) and signs an **ES256 JWT**: header
+  `{alg: ES256, x5c: [leaf, issuing CA]}`, claims
+  `{sub: <SPIFFE URI from its own cert SAN>, aud: "nico-api", iat: now,
+  exp: now+300s}`. The token is cached and re-minted when < 60 s remain — no
+  refresh RPC, and cert renewal is picked up automatically because the files
+  are re-read at each mint.
+- `BearerAuthService` stamps `Authorization: Bearer <jwt>` onto the request.
+  (The TLS channel may still present the client cert too — dual-support; each
+  is sufficient alone.)
+
+**Validation (server side, requires `[node_auth] enabled = true` + TLS listener)**
+
+- The authn middleware sees the Bearer header and hands it to
+  `NodeJwtValidator`, which checks in order:
+  - header `alg` is exactly ES256 (no algorithm substitution);
+  - the `x5c` chain verifies against the **same root CA file the TLS listener
+    uses for client certs** (`[tls] root_cafile_path`) — path building,
+    validity window, client-auth EKU;
+  - the JWT signature verifies with the *verified leaf's* public key;
+  - claims: `exp`/`iat`/`aud` enforced, and lifetime bounded by
+    `max_token_ttl_sec` (default 900 s) so a client can't stretch `exp`;
+  - the leaf passes SPIFFE validation (leaf-only, single URI SAN), and `sub`
+    must equal that SAN — identity comes from the verified cert, never from
+    the claim.
+
+**Authorization & the first call**
+
+- The validated SPIFFE URI is mapped through the same `SpiffeContext` as mTLS
+  certs → a `SpiffeMachineIdentifier` principal, byte-identical to what the
+  cert path would have minted.
+- Casbin RBAC evaluates that principal exactly as before (machine class →
+  Agent/Scout role rules) — **no RBAC changes** — and the handler executes.
+  That is the first authorized gRPC call on bearer auth.
+
+Note: the very first *authorized* call after discovery could ride either
+credential, since the agent holds both from the same moment — the JWT only
+becomes load-bearing once `mtls_enabled = false`.
+
 ## Q1 — How does the agent get a private key that is trusted to create the JWT?
 
 **It already has one.** The node's Vault-issued mTLS client certificate key
@@ -48,9 +121,10 @@ certificate chains to the root CA the API already trusts for client certs —
 the JWT is effectively "mTLS at the application layer".
 
 Bootstrapping is unchanged: a machine obtains its first certificate through
-the existing discovery/attestation → `trigger_certificate_issuance` flow, and
-from that moment it can mint tokens. Minting is best-effort: before the cert
-exists, requests simply carry no bearer header.
+the existing discovery/attestation flow (`DiscoverMachine` / `AttestQuote`
+respond with the machine certificate — see the auth-flow walkthrough above),
+and from that moment it can mint tokens. Minting is best-effort: before the
+cert exists, requests simply carry no bearer header.
 
 ## Q2 — JWT side by side with mTLS
 
