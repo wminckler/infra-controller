@@ -231,3 +231,40 @@ revocation/re-issue cuts off new token minting entirely.
    tracking or DPoP-style proof-of-possession is the hardening path if needed.
 6. **RSA machine certs** → not supported (Vault PKI role is EC P-256
    everywhere); the validator rejects non-EC leaves with a clear debug reason.
+
+## Open question — key storage & sharing on DPF
+
+Today the machine cert/key live at `/opt/forge` on the DPU, a hostPath shared
+by every NICo pod that needs the credential (dpu-agent writes it; fmds and
+otelcol mount it). The key file is written owner-only (0600) and everything
+that reads it runs as root, but the sharing model itself is worth revisiting.
+Three options, in increasing order of change:
+
+1. **Status quo: hostPath file.** The key never leaves the DPU after its
+   one-time delivery in the `DiscoverMachine` response. Weaknesses: it sits
+   on DPU flash, and access control is "whoever can mount the hostPath".
+2. **Kubernetes Secret.** Secret volume mounts are tmpfs, so the key stops
+   touching DPU flash; sharing becomes explicit, per-pod, read-only, and
+   auditable through the K8s API; rotation propagates via kubelet sync.
+   Costs: in DPF the DPU-cluster control plane (kamaji-hosted etcd) runs on
+   the x86 management cluster, so the key gains a durable copy — plus
+   backups — **off the DPU**, which must be covered by etcd encryption at
+   rest; the agent needs new K8s API rights to create/update the Secret; and
+   scout (pre-DPF, live-image) cannot use this path, so the file mechanism
+   survives alongside it.
+3. **Agent as local token broker (recommended target).** Only the dpu-agent
+   holds the key. Co-located services that need to *authenticate to
+   nico-api* fetch a short-lived node JWT from the agent over a local unix
+   socket (SPIFFE-workload-API style) instead of mounting the key to do mTLS.
+   The key's exposure surface shrinks to one process, the hostPath-vs-Secret
+   question becomes mostly moot, and it dovetails with the `mtls_enabled =
+   false` end state. Honest limitation: it only covers *API authentication* —
+   otelcol also uses the cert for TLS client auth to its OTLP gateway, which
+   a nico-api bearer token cannot replace, so the key can only fully
+   disappear from other pods once that ingest path has its own credential
+   story.
+
+Recommendation: stay with the (now 0600) hostPath file in the interim — the
+Secret swap is a modest improvement only when etcd encryption at rest is
+guaranteed — and pursue option 3 as the target. A prototype of the broker
+lives on branch `node-auth-token-broker`.
