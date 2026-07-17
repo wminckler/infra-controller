@@ -59,7 +59,7 @@ async fn setup_vault_with_secrets() -> Option<(
     };
 
     let meter = opentelemetry::global::meter("vault-catalogue-test");
-    let client = create_vault_client(&config, meter).expect("create vault client");
+    let client = create_vault_client(&config, meter, None).expect("create vault client");
 
     // Populate a mix of secrets across prefixes.
     let secrets = vec![

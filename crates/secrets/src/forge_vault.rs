@@ -30,6 +30,7 @@ use opentelemetry::StringValue;
 use opentelemetry::metrics::{Gauge, Meter};
 use rand::RngExt;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 use vaultrs::api::kv2::requests::SetSecretRequestOptions;
 use vaultrs::api::pki::requests::GenerateCertificateRequest;
@@ -450,13 +451,33 @@ impl From<VaultClientSettingsBuilderError> for SecretsError {
 }
 
 impl ForgeVaultClient {
-    fn new(vault_client_config: ForgeVaultClientConfig, vault_metrics: ForgeVaultMetrics) -> Self {
+    /// Constructs the client and starts its long-lived token-refresher task.
+    ///
+    /// When `supervisor` is `Some`, the refresher is registered on the caller's
+    /// [`JoinSet`] so a panic surfaces through `join_all` (and crashes startup)
+    /// instead of silently disabling Vault access. Callers with a process-scoped
+    /// task supervisor (e.g. the dedicated certificate Vault) pass it; the
+    /// credential-store and test clients pass `None` for a detached task, the
+    /// historical behavior.
+    fn new(
+        vault_client_config: ForgeVaultClientConfig,
+        vault_metrics: ForgeVaultMetrics,
+        supervisor: Option<&mut JoinSet<()>>,
+    ) -> Self {
         let (vault_refresher_tx, vault_refresher_rx) = tokio::sync::mpsc::channel(1);
         let vault_client_config_clone = vault_client_config.clone();
-        tokio::spawn(async move {
+        let refresher = async move {
             vault_refresher_loop(vault_refresher_rx, vault_client_config_clone, vault_metrics)
                 .await;
-        });
+        };
+        match supervisor {
+            Some(join_set) => {
+                join_set.spawn(refresher);
+            }
+            None => {
+                tokio::spawn(refresher);
+            }
+        }
         Self {
             vault_client_config,
             vault_refresher_tx,
@@ -1083,6 +1104,7 @@ impl VaultConfig {
 pub fn create_vault_client(
     vault_config: &VaultConfig,
     meter: Meter,
+    supervisor: Option<&mut JoinSet<()>>,
 ) -> eyre::Result<Arc<ForgeVaultClient>> {
     let configured_ca_path = vault_config
         .vault_cacert()
@@ -1111,7 +1133,11 @@ pub fn create_vault_client(
         vault_root_ca_path,
     };
 
-    let forge_vault_client = ForgeVaultClient::new(vault_client_config, forge_vault_metrics);
+    // Register the refresher on the caller's supervisor when one is provided
+    // (the carbide-api server passes its startup `JoinSet`); short-lived and
+    // `select!`-based callers pass `None` for a detached task.
+    let forge_vault_client =
+        ForgeVaultClient::new(vault_client_config, forge_vault_metrics, supervisor);
     Ok(Arc::new(forge_vault_client))
 }
 
@@ -1192,6 +1218,7 @@ pub fn create_dedicated_vault_client(
     config: &DedicatedVaultConfig,
     spiffe: SpiffeIdentity,
     meter: Meter,
+    join_set: &mut JoinSet<()>,
 ) -> eyre::Result<Arc<ForgeVaultClient>> {
     // Required fields are non-`Option`, but an empty string would still slip
     // through serde and build a client that fails confusingly on first use.
@@ -1246,6 +1273,7 @@ pub fn create_dedicated_vault_client(
     Ok(Arc::new(ForgeVaultClient::new(
         vault_client_config,
         build_vault_metrics(&meter),
+        Some(join_set),
     )))
 }
 
@@ -1316,7 +1344,15 @@ mod tests {
         ] {
             let mut config = dedicated_config();
             mutate(&mut config);
-            let err = match create_dedicated_vault_client(&config, test_spiffe(), meter.clone()) {
+            // Empty-field validation rejects before the client (and its task)
+            // is built, so this supervisor never actually receives a task.
+            let mut join_set = tokio::task::JoinSet::new();
+            let err = match create_dedicated_vault_client(
+                &config,
+                test_spiffe(),
+                meter.clone(),
+                &mut join_set,
+            ) {
                 Ok(_) => panic!("empty required field must be rejected"),
                 Err(err) => err,
             };

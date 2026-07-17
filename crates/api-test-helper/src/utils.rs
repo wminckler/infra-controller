@@ -290,7 +290,7 @@ pub async fn populate_initial_vault_secrets(
     metrics: &MetricsSetup,
 ) -> Result<(), Report> {
     let credential_manager =
-        create_credential_manager(credential_config, metrics.meter.clone()).await?;
+        create_credential_manager(credential_config, metrics.meter.clone(), None).await?;
     credential_manager
         .set_credentials(
             &CredentialKey::BmcCredentials {

@@ -78,9 +78,12 @@ pub async fn run_service(config: Config) -> Result<(), DsxConsumerError> {
     // Create consumer metrics
     let consumer_metrics = ConsumerMetrics::new(&meter);
 
+    // Detached refresher: this consumer manages its tasks with `tokio::spawn` +
+    // `select!` rather than a `JoinSet`, so there is no supervisor to register on.
     let credential_manager = carbide_secrets::create_credential_manager(
         &carbide_secrets::CredentialConfig::default(),
         meter.clone(),
+        None,
     )
     .await
     .map_err(|e| DsxConsumerError::Secrets(e.to_string()))?;

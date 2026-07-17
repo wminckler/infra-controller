@@ -18,6 +18,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use opentelemetry::metrics::Meter;
+use tokio::task::JoinSet;
 
 pub use crate::chained_reader::ChainedCredentialReader;
 /// Direct vault access for the narrow cases that need it: `CertificateProvider`
@@ -105,24 +106,35 @@ pub fn create_certificate_provider(
     shared_vault: &Arc<ForgeVaultClient>,
     spiffe: SpiffeIdentity,
     meter: Meter,
+    join_set: &mut JoinSet<()>,
 ) -> eyre::Result<Arc<dyn CertificateProvider>> {
     match &config.backend {
         CertBackend::SharedVault => {
+            // Reuses the already-supervised credential Vault client; no new task.
             let provider: Arc<dyn CertificateProvider> = shared_vault.clone();
             Ok(provider)
         }
         CertBackend::DedicatedVault(dedicated) => {
+            // The dedicated client spawns its own token refresher; register it on
+            // the caller's `JoinSet` so a refresher panic surfaces when the
+            // supervisor is awaited (`join_all`) instead of silently disabling
+            // certificate vending.
             let provider: Arc<dyn CertificateProvider> =
-                create_dedicated_vault_client(dedicated, spiffe, meter)?;
+                create_dedicated_vault_client(dedicated, spiffe, meter, join_set)?;
             Ok(provider)
         }
     }
 }
 
 /// create_credential_manager builds the default credential chain: env -> file -> vault.
+///
+/// `supervisor`, when provided, is the caller's task [`JoinSet`] the vault
+/// client's token refresher is registered on so a panic propagates; pass `None`
+/// for a detached refresher (short-lived or `select!`-based callers).
 pub async fn create_credential_manager(
     config: &CredentialConfig,
     meter: Meter,
+    supervisor: Option<&mut JoinSet<()>>,
 ) -> eyre::Result<Arc<dyn CredentialManager>> {
     let mut readers: Vec<Box<dyn CredentialReader>> = Vec::new();
 
@@ -136,7 +148,7 @@ pub async fn create_credential_manager(
         ));
     }
 
-    let vault_client = create_vault_client(&config.vault, meter)?;
+    let vault_client = create_vault_client(&config.vault, meter, supervisor)?;
     readers.push(Box::new(vault_client.clone()));
 
     let chained = ChainedCredentialReader::from(readers);

@@ -213,8 +213,11 @@ pub async fn run(
 
     let vault_config = vault_config_for_site(&credential_config.vault, &carbide_config);
 
-    // One vault client serves every credential vault role below.
-    let vault_client = create_vault_client(&vault_config, metrics.meter.clone())?;
+    // One vault client serves every credential vault role below. Its token
+    // refresher is supervised on the startup `JoinSet` so a panic propagates
+    // through `join_all` rather than silently disabling credential access.
+    let vault_client =
+        create_vault_client(&vault_config, metrics.meter.clone(), Some(&mut join_set))?;
 
     // Certificate vending is selected independently of the credential store.
     // SharedVault (the default) reuses `vault_client` (no second client or token
@@ -231,6 +234,7 @@ pub async fn run(
             machine_base_path: vault_config.spiffe_machine_base_path(),
         },
         metrics.meter.clone(),
+        &mut join_set,
     )?;
 
     let db_pool = setup::create_and_connect_postgres_pool(&carbide_config).await?;

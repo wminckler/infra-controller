@@ -246,7 +246,7 @@ async fn exercise_import(test_pool: &PgPool) -> eyre::Result<()> {
     };
 
     let meter = opentelemetry::global::meter("secrets-import-test");
-    let vault_client = create_vault_client(&vault_config, meter)?;
+    let vault_client = create_vault_client(&vault_config, meter, None)?;
 
     // --- Populate Vault with secrets ---
     let secrets = generate_test_secrets(100);
